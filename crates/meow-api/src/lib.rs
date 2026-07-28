@@ -16,6 +16,31 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 
+/// How long to wait for the TUN readiness signal (device creation + stack
+/// init + child-task setup) before treating the listener as failed to
+/// start. Shared between the startup path (`meow-app/src/main.rs`) and the
+/// config-reload path (`routes.rs::spawn_tun_from_raw`) so the two don't
+/// drift. Windows wintun adapter creation plus smoltcp netstack init can
+/// take tens of seconds on slow machines; 5 s proved too aggressive.
+pub const TUN_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Map a parsed `TunConfig` onto a `TunListenerConfig`. Shared between the
+/// startup path (`meow-app/src/main.rs`) and the config-reload path
+/// (`routes.rs::spawn_tun_from_raw`) so the two don't drift.
+#[cfg(feature = "listener-tun")]
+pub fn tun_config_to_listener_config(
+    tun: &meow_config::TunConfig,
+) -> meow_listener::TunListenerConfig {
+    meow_listener::TunListenerConfig {
+        device: tun.device.clone(),
+        mtu: tun.mtu,
+        inet4_address: tun.inet4_address,
+        auto_route: tun.auto_route,
+        dns_hijack: tun.dns_hijack,
+        udp_timeout: tun.udp_timeout,
+    }
+}
+
 pub struct ApiServer {
     tunnel: Tunnel,
     listen_addr: SocketAddr,
@@ -68,6 +93,7 @@ impl ApiServer {
             rule_providers: Arc::clone(&self.rule_providers),
             listeners: self.listeners.clone(),
             external_ui: self.resolve_external_ui(),
+            config_mutation_lock: tokio::sync::Mutex::new(()),
         });
 
         let app = routes::create_router(state);

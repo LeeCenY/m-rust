@@ -26,6 +26,9 @@ use tokio::sync::{broadcast, Mutex};
 use tower_http::cors::CorsLayer;
 use tracing::{debug, info};
 
+#[cfg(feature = "listener-tun")]
+use meow_listener::TunListener;
+
 use crate::log_stream::{parse_log_level, LogMessage};
 use crate::ui;
 
@@ -70,6 +73,13 @@ pub struct AppState {
     /// Validated directory for a third-party web UI. When `Some`, it is served
     /// at `/ui`; when `None`, the built-in panel is served (issue #223).
     pub external_ui: Option<std::path::PathBuf>,
+    /// Serialises `put_configs` and `commit_raw_candidate` so that the
+    /// "read-old-config → write-new-config → TUN reconcile" sequence is
+    /// executed atomically with respect to other config mutations.  Without
+    /// this a concurrent PUT could stop_tun before a sibling's
+    /// set_tun_handle has completed, leaving a running TUN device behind an
+    /// `enable=false` config.
+    pub config_mutation_lock: tokio::sync::Mutex<()>,
 }
 
 /// The API server owns one raw/runtime configuration, so all mutation
@@ -578,6 +588,11 @@ struct ConfigResponse {
     bind_address: String,
     #[serde(rename = "ipv6")]
     ipv6: bool,
+    /// Whether the TUN listener is currently running (issue #326).
+    /// Mirrors `tun.enable` from the raw config and reflects actual
+    /// runtime state so nyanpasu can correctly render its toggle.
+    #[serde(rename = "tun-enable")]
+    tun_enable: bool,
 }
 
 async fn get_configs(State(state): State<Arc<AppState>>) -> Json<ConfigResponse> {
@@ -597,6 +612,7 @@ async fn get_configs(State(state): State<Arc<AppState>>) -> Json<ConfigResponse>
             .clone()
             .unwrap_or_else(|| "0.0.0.0".to_string()),
         ipv6: raw.ipv6.unwrap_or(false),
+        tun_enable: state.tunnel.has_tun(),
     })
 }
 
@@ -955,7 +971,7 @@ async fn commit_raw_candidate(
     candidate: RawConfig,
 ) -> Result<(), (StatusCode, String)> {
     apply_raw_to_tunnel(candidate.clone(), state).await?;
-    *state.raw_config.write() = candidate;
+    swap_config_and_reconcile_tun(state, candidate).await;
     Ok(())
 }
 
@@ -1574,6 +1590,112 @@ async fn get_group_delay(
 // Class B per ADR-0002: payload must be base64 (upstream inconsistent); YAML parse errors
 // always return 400 even with force=true; NOT upstream silent broken-config apply.
 
+/// Spawn a TUN listener from a raw config and wait for device readiness.
+/// Returns `None` when the `listener-tun` feature is not compiled in,
+/// when `tun.enable` is false, or when the listener fails to start
+/// (permission denied, device-name conflict, etc.).
+#[cfg(feature = "listener-tun")]
+async fn spawn_tun_from_raw(
+    tunnel: &Tunnel,
+    raw: &RawConfig,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let tun_cfg = match meow_config::parse_tun_config(raw.tun.as_ref()) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("tun config parse error: {e}");
+            return None;
+        }
+    };
+    if !tun_cfg.enable {
+        return None;
+    }
+
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let listener = TunListener::new(
+        tunnel.clone(),
+        crate::tun_config_to_listener_config(&tun_cfg),
+        "tun".to_string(),
+    )
+    .with_readiness_signal(ready_tx);
+
+    let handle = tokio::spawn(async move {
+        if let Err(e) = listener.run().await {
+            tracing::error!("TUN listener error: {e}");
+        }
+    });
+
+    // Await the readiness signal so we don't store a dead JoinHandle when
+    // device creation fails (e.g. os error 5 / permission denied). The
+    // timeout guards against a genuinely stuck startup path.
+    match tokio::time::timeout(crate::TUN_STARTUP_TIMEOUT, ready_rx).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => {
+            tracing::error!(
+                "TUN listener failed to start (device creation failed — \
+                 check permissions / admin / CAP_NET_ADMIN)"
+            );
+            handle.abort();
+            return None;
+        }
+        Err(_) => {
+            tracing::error!(
+                "TUN listener startup timed out after {} s",
+                crate::TUN_STARTUP_TIMEOUT.as_secs()
+            );
+            handle.abort();
+            return None;
+        }
+    }
+
+    Some(handle)
+}
+
+#[cfg(not(feature = "listener-tun"))]
+async fn spawn_tun_from_raw(
+    _tunnel: &Tunnel,
+    raw: &RawConfig,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if raw.tun.as_ref().is_some_and(|t| t.enable) {
+        tracing::warn!("tun.enable is set but this build lacks the 'listener-tun' feature");
+    }
+    None
+}
+
+/// Commit `candidate` as the new raw config and reconcile the TUN listener
+/// against the `tun.enable` transition. The whole sequence is serialised by
+/// `config_mutation_lock` so two concurrent mutations cannot interleave
+/// their TUN start/stop operations — without this a disable→stop could run
+/// before a sibling enable→start has stored its handle, leaving a running
+/// device behind an `enable=false` config.
+async fn swap_config_and_reconcile_tun(state: &AppState, candidate: RawConfig) {
+    let _guard = state.config_mutation_lock.lock().await;
+
+    let new_enable = candidate.tun.as_ref().is_some_and(|t| t.enable);
+    // Snapshot the candidate (only on an off→on transition, before it is
+    // moved into the lock) so the parking_lot write guard — which is
+    // !Send — is dropped before the first .await below.
+    let (old_enable, snapshot) = {
+        let mut guard = state.raw_config.write();
+        let old = guard.tun.as_ref().is_some_and(|t| t.enable);
+        let snapshot = (new_enable && !old).then(|| candidate.clone());
+        *guard = candidate;
+        (old, snapshot)
+    };
+
+    if old_enable == new_enable {
+        return;
+    }
+    if let Some(snapshot) = snapshot {
+        if let Some(handle) = spawn_tun_from_raw(&state.tunnel, &snapshot).await {
+            state.tunnel.set_tun_handle(handle).await;
+            info!("TUN listener started via config reload");
+        }
+    } else {
+        state.tunnel.stop_tun().await;
+        info!("TUN listener stopped via config reload");
+    }
+}
+
 #[derive(Deserialize)]
 struct PutConfigsBody {
     path: Option<String>,
@@ -1692,7 +1814,8 @@ async fn put_configs(
             state.tunnel.set_mode(mode);
         }
     }
-    *state.raw_config.write() = raw_config;
+
+    swap_config_and_reconcile_tun(&state, raw_config).await;
 
     StatusCode::NO_CONTENT.into_response()
 }
