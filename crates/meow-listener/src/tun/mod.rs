@@ -33,6 +33,9 @@
 //! (CAP_NET_ADMIN).
 
 mod device;
+mod dns;
+#[cfg(target_os = "windows")]
+mod local_dns;
 mod route;
 mod udp;
 
@@ -41,7 +44,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use ipnet::Ipv4Net;
@@ -49,7 +52,7 @@ use meow_common::{ConnType, Metadata, Network, ProxyConn};
 use meow_tunnel::Tunnel;
 use netstack_smoltcp::{StackBuilder, TcpStream};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use route::RouteGuard;
 
@@ -112,15 +115,87 @@ pub struct TunListenerConfig {
     pub udp_timeout: Duration,
 }
 
+/// Outcome of TUN listener startup, sent through the readiness channel.
+/// Allows callers to distinguish immediate setup failure from a timeout
+/// without waiting for the full `TUN_STARTUP_TIMEOUT`.
+pub enum TunReady {
+    /// Device + stack + child tasks are fully initialized.
+    Ready,
+    /// Setup failed before reaching the accept loop.  The String carries
+    /// the underlying error message so callers can surface it directly.
+    Failed(String),
+}
+
+/// RAII helper that guarantees the readiness oneshot is always fired.
+///
+/// If `ready()` is called, the sender sends `TunReady::Ready` and is
+/// consumed (no drop-side-effect).  If the notifier is dropped without
+/// a prior `ready()` call — e.g. because `run()` hit a `?` and the
+/// local variable goes out of scope — the sender fires
+/// `TunReady::Failed(...)` so the caller gets an immediate,
+/// descriptive error instead of a bare `RecvError`.
+struct ReadyNotifier {
+    tx: Option<tokio::sync::oneshot::Sender<TunReady>>,
+}
+
+impl ReadyNotifier {
+    fn new(tx: tokio::sync::oneshot::Sender<TunReady>) -> Self {
+        Self { tx: Some(tx) }
+    }
+
+    /// Consume the notifier and send `TunReady::Ready`.
+    fn ready(mut self) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(TunReady::Ready);
+        } else {
+            tracing::warn!("ReadyNotifier::ready called but tx was already None");
+        }
+    }
+
+    /// Consume the notifier and send `TunReady::Failed` carrying the real
+    /// setup error, so callers surface the underlying cause instead of the
+    /// generic drop-time message.
+    fn fail(mut self, msg: String) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(TunReady::Failed(msg));
+        }
+    }
+}
+
+impl Drop for ReadyNotifier {
+    fn drop(&mut self) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(TunReady::Failed(
+                "listener setup failed before reaching readiness".into(),
+            ));
+        }
+    }
+}
+
+/// Wraps [`tun_rs::AsyncDevice`] together with its [`RouteGuard`] in a
+/// single `Arc` so they share one reference-counted lifetime. Field
+/// declaration order guarantees `route_guard` is dropped (routes deleted)
+/// **before** `device` (adapter destroyed) when the last `Arc` clone goes
+/// away — ensuring route deletion always succeeds because the adapter is
+/// still alive.
+struct TunDevice {
+    /// Held only for its `Drop` side effect — routes are deleted when
+    /// this field is dropped, before `device` is destroyed.
+    #[allow(dead_code)]
+    route_guard: Option<RouteGuard>,
+    pub(super) device: tun_rs::AsyncDevice,
+}
+
 pub struct TunListener {
     tunnel: Tunnel,
     cfg: TunListenerConfig,
     name: String,
     /// Optional readiness signal: sent once after the device, stack, and
     /// child tasks are fully initialized (before the accept loop).
-    /// Dropped on setup failure so callers can distinguish "not started"
-    /// from "briefly delayed".
-    ready: Option<tokio::sync::oneshot::Sender<()>>,
+    /// If the listener fails before reaching that point the notifier's
+    /// `Drop` impl sends `TunReady::Failed`, giving callers an immediate
+    /// error without waiting for a timeout.
+    ready: Option<tokio::sync::oneshot::Sender<TunReady>>,
 }
 
 impl TunListener {
@@ -133,44 +208,161 @@ impl TunListener {
         }
     }
 
-    /// Attach a readiness signal. The sender will fire after device
-    /// creation + stack init + child-task setup succeeds, and before the
-    /// accept loop starts. If `run()` fails before reaching that point,
-    /// the sender is dropped — the receiver sees a `RecvError`.
-    pub fn with_readiness_signal(mut self, tx: tokio::sync::oneshot::Sender<()>) -> Self {
+    /// Attach a readiness signal. The sender will fire `TunReady::Ready`
+    /// after device creation + stack init + child-task setup succeeds,
+    /// and before the accept loop starts.  If `run()` fails before
+    /// reaching that point the notifier's `Drop` impl sends
+    /// `TunReady::Failed(msg)`, giving callers an immediate error without
+    /// waiting for a timeout.
+    pub fn with_readiness_signal(mut self, tx: tokio::sync::oneshot::Sender<TunReady>) -> Self {
         self.ready = Some(tx);
         self
     }
 
     pub async fn run(mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Extract the readiness sender into a notifier so setup failures
+        // reach the caller immediately: an `Err` from `run_inner` sends
+        // `TunReady::Failed` with the real error message, and if the future
+        // is dropped mid-setup the notifier's `Drop` impl sends a generic
+        // failure — either way no timeout wait.
+        let mut notifier = self.ready.take().map(ReadyNotifier::new);
+        let result = self.run_inner(&mut notifier).await;
+        if let Err(e) = &result {
+            if let Some(n) = notifier.take() {
+                n.fail(e.to_string());
+            }
+        }
+        result
+    }
+
+    async fn run_inner(
+        &self,
+        notifier: &mut Option<ReadyNotifier>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let t0 = Instant::now();
+        info!("TUN listener '{}' starting...", self.name);
+
         let cfg = &self.cfg;
 
-        let mut builder = tun_rs::DeviceBuilder::new().mtu(cfg.mtu).ipv4(
-            cfg.inet4_address.addr(),
-            cfg.inet4_address.prefix_len(),
-            None,
-        );
-        if let Some(name) = &cfg.device {
-            builder = builder.name(name);
+        // Try up to 5 device names and IPs in case the previous instance
+        // left a stale adapter that hasn't been cleaned up yet (common on
+        // Windows after an unclean shutdown).  After the first retry fails,
+        // we also rotate the TUN IP to work around address conflicts.
+        //
+        // Each attempt runs on a blocking thread; the outer caller's
+        // TUN_STARTUP_TIMEOUT guards the overall time spent here.
+        const MAX_TUN_RETRIES: u32 = 5;
+        let base_addr = cfg.inet4_address.addr();
+        let prefix = cfg.inet4_address.prefix_len();
+        let mut device: Option<tun_rs::AsyncDevice> = None;
+        let mut dev_name = String::new();
+        let mut used_addr = base_addr;
+
+        for attempt in 0..MAX_TUN_RETRIES {
+            let name = device_name_for_attempt(cfg.device.as_deref(), attempt);
+
+            // Rotate IP after the first retry fails (attempt >= 2).
+            // Each /30 subnet spans 4 addresses, so we step by 4.
+            let addr = if attempt >= 2 {
+                let offset = (attempt - 1) * 4;
+                std::net::Ipv4Addr::from(u32::from(base_addr).wrapping_add(offset))
+            } else {
+                base_addr
+            };
+            let ip_display = format!("{addr}/{prefix}");
+
+            // Copy the values we need inside `spawn_blocking` so we don't
+            // borrow `cfg` across the closure boundary.
+            let mtu = cfg.mtu;
+            let name_for_closure = name.clone();
+
+            let display_name = name.as_deref().unwrap_or("<platform default>");
+            info!(
+                "creating TUN device '{}' with {} (attempt {}/{})...",
+                display_name,
+                ip_display,
+                attempt + 1,
+                MAX_TUN_RETRIES,
+            );
+
+            match tokio::task::spawn_blocking(move || {
+                let mut builder = tun_rs::DeviceBuilder::new()
+                    .mtu(mtu)
+                    .ipv4(addr, prefix, None);
+                if let Some(n) = &name_for_closure {
+                    builder = builder.name(n);
+                }
+                builder.build_async()
+            })
+            .await
+            {
+                Ok(Ok(d)) => {
+                    dev_name = d
+                        .name()
+                        .unwrap_or_else(|_| name.clone().unwrap_or_default());
+                    used_addr = addr;
+                    device = Some(d);
+                    break;
+                }
+                Ok(Err(e)) => {
+                    warn!("failed to create TUN device '{}': {e}", display_name);
+                }
+                Err(join_err) => {
+                    warn!(
+                        "spawn_blocking for TUN device '{}' panicked: {join_err}",
+                        display_name
+                    );
+                }
+            }
+
+            if attempt + 1 >= MAX_TUN_RETRIES {
+                return Err(Box::new(io::Error::other(format!(
+                    "failed to create TUN device after {MAX_TUN_RETRIES} attempts"
+                ))));
+            }
         }
-        let device = builder.build_async().map_err(|e| {
-            io::Error::new(
-                e.kind(),
-                format!(
-                    "failed to create TUN device: {e} (requires root/CAP_NET_ADMIN on \
-                     Linux/macOS; elevation + wintun.dll on Windows)"
-                ),
-            )
-        })?;
-        let device = Arc::new(device);
-        let dev_name = device.name().unwrap_or_else(|_| "<unknown>".into());
+        // SAFETY: the loop either breaks with `device = Some(...)` and
+        // `dev_name` set, or returns `Err` above.
+        let device = device.unwrap();
+
+        let tun_create_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        info!("TUN device '{dev_name}' created in {tun_create_ms:.0}ms");
+
+        // Obtain the interface index before moving `device` into `TunDevice`.
+        let if_index = device.if_index()?;
 
         // auto-route v1: capture exactly the fake-IP range (see module docs).
-        let _routes = if cfg.auto_route {
+        //
+        // RouteManager::add() calls into OS routing APIs that may block
+        // (PowerShell on Windows), so it runs on a blocking thread. The
+        // outer TUN_STARTUP_TIMEOUT guards the overall startup.
+        let route_guard = if cfg.auto_route {
             match self.tunnel.resolver().fake_ip_v4_net() {
                 Some(fake_net) => {
-                    let if_index = device.if_index()?;
-                    Some(RouteGuard::setup(if_index, &[fake_net])?)
+                    let t_route = Instant::now();
+
+                    let result = tokio::task::spawn_blocking(move || {
+                        RouteGuard::setup(if_index, &[fake_net])
+                    })
+                    .await;
+
+                    match result {
+                        Ok(Ok(g)) => {
+                            let route_ms = t_route.elapsed().as_secs_f64() * 1000.0;
+                            info!("auto-route installed in {route_ms:.0}ms");
+                            Some(g)
+                        }
+                        Ok(Err(e)) => {
+                            return Err(Box::new(io::Error::other(format!(
+                                "failed to install auto-route: {e}"
+                            ))));
+                        }
+                        Err(join_err) => {
+                            return Err(Box::new(io::Error::other(format!(
+                                "auto-route spawn_blocking panicked: {join_err}"
+                            ))));
+                        }
+                    }
                 }
                 None => {
                     warn!(
@@ -187,9 +379,65 @@ impl TunListener {
             None
         };
 
+        // Wrap the device and its route guard in a single `Arc` so they share
+        // one reference-counted lifetime. Field order guarantees `route_guard`
+        // is dropped (routes deleted) **before** `device` (adapter destroyed)
+        // when the last `Arc` clone goes away — ensuring route deletion always
+        // succeeds because the adapter is still alive.
+        let device = Arc::new(TunDevice {
+            route_guard,
+            device,
+        });
+
+        // Windows: bind the loopback DNS sockets *before* DnsGuard repoints
+        // the OS resolver at them. If port 53 is already taken (ICS, Docker,
+        // another resolver), this fails startup loudly instead of silently
+        // leaving the whole machine with DNS aimed at a dead address.
+        #[cfg(target_os = "windows")]
+        let local_dns_sockets = if cfg.dns_hijack
+            && cfg.auto_route
+            && self.tunnel.resolver().fake_ip_v4_gateway().is_some()
+        {
+            Some(local_dns::bind().await.map_err(|e| {
+                io::Error::other(format!("loopback DNS server startup failed: {e}"))
+            })?)
+        } else {
+            None
+        };
+
+        // When dns-hijack is on and we're in fake-IP mode, point the OS
+        // resolver at the loopback DNS server.  The backup + set calls into
+        // PowerShell (Get-DnsClientServerAddress / Set-DnsClientServerAddress)
+        // which can take tens of seconds on Windows, so run them on a
+        // blocking thread. The outer TUN_STARTUP_TIMEOUT guards the overall
+        // startup.
+        let _dns_guard = if cfg.dns_hijack && cfg.auto_route {
+            let t_dns = Instant::now();
+            let guard = match self.tunnel.resolver().fake_ip_v4_gateway() {
+                Some(gateway) => {
+                    let g = tokio::task::spawn_blocking(move || dns::DnsGuard::setup(gateway))
+                        .await
+                        .map_err(|join_err| {
+                            Box::new(io::Error::other(format!(
+                                "dns-guard spawn_blocking panicked: {join_err}"
+                            )))
+                        })?;
+                    let dns_ms = t_dns.elapsed().as_secs_f64() * 1000.0;
+                    let dns_active = g.is_some();
+                    info!("dns-guard setup took {dns_ms:.0}ms (active: {dns_active})");
+                    g
+                }
+                None => None,
+            };
+            guard
+        } else {
+            None
+        };
+
         // ICMP rides on the TCP interface (echo replies are answered by
         // smoltcp itself), hence tcp+icmp+udp; with tcp and udp enabled the
         // runner/listener/socket options are always populated.
+        let t_stack = Instant::now();
         let (stack, runner, udp_socket, tcp_listener) = StackBuilder::default()
             .mtu(usize::from(cfg.mtu))
             .enable_tcp(true)
@@ -200,7 +448,22 @@ impl TunListener {
         let mut tcp_listener = tcp_listener.expect("netstack TCP listener (TCP enabled)");
         let udp_socket = udp_socket.expect("netstack UDP socket (UDP enabled)");
 
+        let stack_ms = t_stack.elapsed().as_secs_f64() * 1000.0;
+        info!("netstack built in {stack_ms:.0}ms");
+
         let mut tasks = TaskGroup::new();
+
+        // Windows: start the local DNS server on the sockets bound earlier
+        // (before DnsGuard repointed system DNS at 127.0.0.1 / ::1). The
+        // server answers queries using the same DnsServer::handle_query
+        // pipeline as the TUN dns-hijack path, returning fake IPs.
+        #[cfg(target_os = "windows")]
+        if let Some(sockets) = local_dns_sockets {
+            let resolver = Arc::clone(self.tunnel.resolver());
+            tasks.spawn(async move {
+                local_dns::run(sockets, resolver).await;
+            });
+        }
 
         tasks.spawn(async move {
             let _ = runner.await;
@@ -214,26 +477,36 @@ impl TunListener {
             cfg.dns_hijack,
             cfg.udp_timeout,
             self.name.clone(),
+            cfg.inet4_address,
         ));
 
+        let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
         info!(
-            "TUN listener '{}' started on device '{dev_name}' ({}, mtu {}, auto-route: {}, \
-             dns-hijack: {})",
-            self.name, cfg.inet4_address, cfg.mtu, cfg.auto_route, cfg.dns_hijack
+            "TUN listener '{}' started on device '{dev_name}' ({}/{}, mtu {}, auto-route: {}, \
+             dns-hijack: {}, total startup {total_ms:.0}ms)",
+            self.name, used_addr, prefix, cfg.mtu, cfg.auto_route, cfg.dns_hijack
         );
 
         // Signal readiness: device, stack, and child tasks are all up.
-        // If we return Err before this point the sender is dropped,
-        // which allows callers (put_configs / startup) to surface the
-        // failure instead of silently storing a dead JoinHandle.
-        if let Some(ready) = self.ready.take() {
-            let _ = ready.send(());
+        // An `Err` return from this function sends `TunReady::Failed`
+        // (with the real error) from `run` instead.
+        if let Some(notifier) = notifier.take() {
+            notifier.ready();
+            debug!("TUN listener '{}' readiness signalled", self.name);
         }
 
+        let tun_net = cfg.inet4_address;
         loop {
             tokio::select! {
                 accepted = tcp_listener.next() => match accepted {
                     Some((stream, src, dst)) => {
+                        // Same loop guard as the UDP path: a dial to the
+                        // TUN's own subnet routes back into the device.
+                        if udp::is_looping_dst(dst.ip(), tun_net) {
+                            debug!("tun TCP: dropping non-routable dst {dst} (from {src})");
+                            drop(stream);
+                            continue;
+                        }
                         let tunnel = self.tunnel.clone();
                         let name = self.name.clone();
                         tasks.spawn(async move {
@@ -250,6 +523,26 @@ impl TunListener {
                 }
             }
         }
+    }
+}
+
+/// Device name to try on creation `attempt` (0-based).
+///
+/// macOS only accepts `utunN` device names and picks one itself when none is
+/// given, so never invent a name there — pass the configured name through
+/// unchanged (suffix rotation would produce an invalid `utunN-1`). Elsewhere
+/// default to "meow-tun" and rotate a numeric suffix to sidestep stale
+/// adapters from unclean shutdowns (common with wintun).
+fn device_name_for_attempt(configured: Option<&str>, attempt: u32) -> Option<String> {
+    if cfg!(target_os = "macos") {
+        configured.map(str::to_string)
+    } else {
+        let base = configured.unwrap_or("meow-tun");
+        Some(if attempt == 0 {
+            base.to_string()
+        } else {
+            format!("{base}-{attempt}")
+        })
     }
 }
 
@@ -317,3 +610,41 @@ impl AsyncWrite for TunTcpConn {
 }
 
 impl ProxyConn for TunTcpConn {}
+
+#[cfg(test)]
+mod tests {
+    use super::device_name_for_attempt;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_never_invents_a_device_name() {
+        // Regression: passing a non-`utun` name to tun-rs fails device
+        // creation on macOS ("device name must start with utun"), so an
+        // unset `tun.device` must stay unset — the platform picks `utunN`.
+        for attempt in 0..5 {
+            assert_eq!(device_name_for_attempt(None, attempt), None);
+            assert_eq!(
+                device_name_for_attempt(Some("utun7"), attempt),
+                Some("utun7".to_string()),
+                "configured name passes through without suffix rotation"
+            );
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn default_name_rotates_suffix_on_retries() {
+        assert_eq!(
+            device_name_for_attempt(None, 0),
+            Some("meow-tun".to_string())
+        );
+        assert_eq!(
+            device_name_for_attempt(None, 2),
+            Some("meow-tun-2".to_string())
+        );
+        assert_eq!(
+            device_name_for_attempt(Some("mytun"), 1),
+            Some("mytun-1".to_string())
+        );
+    }
+}

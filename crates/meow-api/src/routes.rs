@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, Mutex};
 use tower_http::cors::CorsLayer;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 #[cfg(feature = "listener-tun")]
 use meow_listener::TunListener;
@@ -1609,30 +1609,29 @@ async fn get_group_delay(
 // always return 400 even with force=true; NOT upstream silent broken-config apply.
 
 /// Spawn a TUN listener from a raw config and wait for device readiness.
-/// Returns `None` when the `listener-tun` feature is not compiled in,
-/// when `tun.enable` is false, or when the listener fails to start
-/// (permission denied, device-name conflict, etc.).
+/// Returns `Ok(Some(handle))` on success, `Ok(None)` when `tun.enable` is
+/// false or the feature is not compiled in, or `Err(msg)` when startup fails
+/// (permission denied, device-name conflict, timeout, etc.).
 #[cfg(feature = "listener-tun")]
 async fn spawn_tun_from_raw(
     tunnel: &Tunnel,
     raw: &RawConfig,
-) -> Option<tokio::task::JoinHandle<()>> {
+) -> Result<Option<tokio::task::JoinHandle<()>>, String> {
     let tun_cfg = match meow_config::parse_tun_config(raw.tun.as_ref()) {
         Ok(c) => c,
         Err(e) => {
-            tracing::error!("tun config parse error: {e}");
-            return None;
+            return Err(format!("tun config parse error: {e}"));
         }
     };
     if !tun_cfg.enable {
-        return None;
+        return Ok(None);
     }
 
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let listener = TunListener::new(
         tunnel.clone(),
         crate::tun_config_to_listener_config(&tun_cfg),
-        "tun".to_string(),
+        "meow-tun".to_string(),
     )
     .with_readiness_signal(ready_tx);
 
@@ -1644,39 +1643,50 @@ async fn spawn_tun_from_raw(
 
     // Await the readiness signal so we don't store a dead JoinHandle when
     // device creation fails (e.g. os error 5 / permission denied). The
-    // timeout guards against a genuinely stuck startup path.
+    // timeout guards against a genuinely stuck startup path; immediate
+    // failures are reported through `TunReady::Failed` without delay.
     match tokio::time::timeout(crate::TUN_STARTUP_TIMEOUT, ready_rx).await {
-        Ok(Ok(())) => {}
-        Ok(Err(_)) => {
+        Ok(Ok(meow_listener::TunReady::Ready)) => {}
+        Ok(Ok(meow_listener::TunReady::Failed(msg))) => {
             tracing::error!(
-                "TUN listener failed to start (device creation failed — \
-                 check permissions / admin / CAP_NET_ADMIN)"
+                "TUN listener failed to start: {msg} \
+                 (check permissions / admin / CAP_NET_ADMIN)"
             );
             handle.abort();
-            return None;
+            return Err(msg);
+        }
+        Ok(Err(_)) => {
+            // Should not happen with ReadyNotifier, but handle defensively.
+            tracing::error!("TUN listener readiness signal dropped unexpectedly");
+            handle.abort();
+            return Err("TUN listener readiness signal dropped unexpectedly".into());
         }
         Err(_) => {
-            tracing::error!(
+            let msg = format!(
                 "TUN listener startup timed out after {} s",
                 crate::TUN_STARTUP_TIMEOUT.as_secs()
             );
+            tracing::error!("{msg}");
             handle.abort();
-            return None;
+            return Err(msg);
         }
     }
 
-    Some(handle)
+    Ok(Some(handle))
 }
 
 #[cfg(not(feature = "listener-tun"))]
 async fn spawn_tun_from_raw(
     _tunnel: &Tunnel,
     raw: &RawConfig,
-) -> Option<tokio::task::JoinHandle<()>> {
+) -> Result<Option<tokio::task::JoinHandle<()>>, String> {
     if raw.tun.as_ref().is_some_and(|t| t.enable) {
-        tracing::warn!("tun.enable is set but this build lacks the 'listener-tun' feature");
+        // Err (not Ok(None)) so the off→on reconcile path rolls
+        // `tun.enable` back — otherwise the stored config would claim TUN
+        // is enabled while nothing can ever run.
+        return Err("this build lacks the 'listener-tun' feature".into());
     }
-    None
+    Ok(None)
 }
 
 /// Commit `candidate` as the new raw config and reconcile the TUN listener
@@ -1685,6 +1695,12 @@ async fn spawn_tun_from_raw(
 /// their TUN start/stop operations — without this a disable→stop could run
 /// before a sibling enable→start has stored its handle, leaving a running
 /// device behind an `enable=false` config.
+///
+/// On an off→on transition, if the TUN listener fails to start the stored
+/// config is rolled back (`tun.enable` set to `false`) to prevent state
+/// inconsistency (the HTTP API would report TUN as enabled but nothing is
+/// actually running).  The HTTP response is still 204 — the error is
+/// logged but not surfaced to the caller.
 async fn swap_config_and_reconcile_tun(state: &AppState, candidate: RawConfig) {
     let _guard = state.config_mutation_lock.lock().await;
 
@@ -1704,11 +1720,28 @@ async fn swap_config_and_reconcile_tun(state: &AppState, candidate: RawConfig) {
         return;
     }
     if let Some(snapshot) = snapshot {
-        if let Some(handle) = spawn_tun_from_raw(&state.tunnel, &snapshot).await {
-            state.tunnel.set_tun_handle(handle).await;
-            info!("TUN listener started via config reload");
+        // off → on
+        match spawn_tun_from_raw(&state.tunnel, &snapshot).await {
+            Ok(Some(handle)) => {
+                state.tunnel.set_tun_handle(handle).await;
+                info!("TUN listener started via config reload");
+            }
+            Ok(None) => {
+                // enable=true but spawn returned no handle — should not
+                // happen for this transition, but treat as success.
+            }
+            Err(e) => {
+                // TUN failed to start — roll back tun.enable to false so
+                // nyanpasu / the dashboard don't show TUN as active when
+                // nothing is actually running.
+                warn!("TUN listener failed to start: {e} (config rolled back)");
+                if let Some(ref mut tun) = state.raw_config.write().tun {
+                    tun.enable = false;
+                }
+            }
         }
     } else {
+        // on → off
         state.tunnel.stop_tun().await;
         info!("TUN listener stopped via config reload");
     }
