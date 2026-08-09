@@ -588,6 +588,9 @@ fn rebuild_from_raw_impl(
     apply_dialer_proxies(&mut proxies, raw.proxies.as_deref().unwrap_or(&[]));
 
     let download_proxy = internal_http::first_named_proxy(raw.proxies.as_deref(), &proxies);
+    // Per-provider `proxy:` overrides resolve against the full registry —
+    // groups and provider-sourced proxies included (issue #377).
+    let registry_lookup = |name: &str| proxies.get(name).cloned();
 
     // Fetch/read rule-provider payload bytes once — the parser-context build
     // scans them for geo keys (issue #277) and the provider load below parses
@@ -597,9 +600,12 @@ fn rebuild_from_raw_impl(
         Some(p) => p,
         None => {
             owned_payloads = match raw.rule_providers.as_ref() {
-                Some(map) if !map.is_empty() => {
-                    rule_provider::prefetch_payloads(map, cache_dir, download_proxy.as_ref())
-                }
+                Some(map) if !map.is_empty() => rule_provider::prefetch_payloads(
+                    map,
+                    cache_dir,
+                    download_proxy.as_ref(),
+                    &registry_lookup,
+                ),
                 _ => HashMap::new(),
             };
             &owned_payloads
@@ -621,6 +627,7 @@ fn rebuild_from_raw_impl(
             cache_dir,
             ctx,
             download_proxy.as_ref(),
+            &registry_lookup,
             payloads,
         ),
         _ => HashMap::new(),
@@ -691,17 +698,26 @@ async fn prefetch_rule_provider_payloads_async(
         return HashMap::new();
     };
     let raw_providers = raw_providers.clone();
-    let download_proxy: Option<Arc<dyn Proxy>> = raw
-        .proxies
-        .as_deref()
-        .unwrap_or(&[])
-        .iter()
-        .find_map(|raw_proxy| proxy_parser::parse_proxy(raw_proxy).ok());
+    let raw_proxies: Vec<HashMap<String, serde_yaml::Value>> =
+        raw.proxies.clone().unwrap_or_default();
     spawn_blocking_with_current_dispatcher(move || {
+        let default_proxy: Option<Arc<dyn Proxy>> = raw_proxies
+            .iter()
+            .find_map(|raw_proxy| proxy_parser::parse_proxy(raw_proxy).ok());
+        // Pre-registry `proxy:` resolution parses the named leaf out of the
+        // raw `proxies:` block; group names don't resolve here, so their
+        // providers skip prefetch and fetch during the registry-backed load.
+        let lookup = |wanted: &str| {
+            raw_proxies
+                .iter()
+                .filter(|p| p.get("name").and_then(serde_yaml::Value::as_str) == Some(wanted))
+                .find_map(|raw_proxy| proxy_parser::parse_proxy(raw_proxy).ok())
+        };
         rule_provider::prefetch_payloads(
             &raw_providers,
             cache_dir.as_deref(),
-            download_proxy.as_ref(),
+            default_proxy.as_ref(),
+            &lookup,
         )
     })
     .await
@@ -740,14 +756,17 @@ async fn load_rule_providers_async(
     cache_dir: Option<PathBuf>,
     ctx: meow_rules::ParserContext,
     download_proxy: Option<Arc<dyn Proxy>>,
+    registry: HashMap<SmolStr, Arc<dyn Proxy>>,
     provider_payloads: Arc<rule_provider::PrefetchedPayloads>,
 ) -> Result<HashMap<String, Arc<rule_provider::RuleProvider>>, anyhow::Error> {
     spawn_blocking_with_current_dispatcher(move || {
+        let lookup = |name: &str| registry.get(name).cloned();
         rule_provider::load_providers_prefetched(
             &raw_providers,
             cache_dir.as_deref(),
             &ctx,
             download_proxy.as_ref(),
+            &lookup,
             &provider_payloads,
         )
     })
@@ -1564,6 +1583,7 @@ async fn build_config(
                 cache_dir_buf.clone(),
                 ctx.clone(),
                 download_proxy,
+                proxies.clone(),
                 provider_payloads,
             )
             .await?
@@ -1877,6 +1897,7 @@ mod geoip_context_tests {
                 url: None,
                 path: None,
                 interval: None,
+                proxy: None,
                 payload: Some(vec!["GEOIP,KR".to_string(), "GEOSITE,youtube".to_string()]),
             },
         );

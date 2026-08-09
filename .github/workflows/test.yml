@@ -71,7 +71,10 @@ jobs:
 
       - name: Install ssserver
         if: steps.cache-ssserver.outputs.cache-hit != 'true'
-        run: cargo install shadowsocks-rust --features "stream-cipher aead-cipher-2022" --locked
+        # --force: on a Cargo.lock change this step's cache misses, but the
+        # rust-cache restore may already have an ssserver in ~/.cargo/bin,
+        # and a plain `cargo install` refuses to overwrite it.
+        run: cargo install shadowsocks-rust --features "stream-cipher aead-cipher-2022" --locked --force
 
       - name: Install simple-obfs (obfs-local / obfs-server)
         run: |

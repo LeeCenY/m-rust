@@ -121,9 +121,10 @@ pub struct ConnectionInfo {
 
 /// Values exposed by the mihomo `/traffic` stream, captured together under
 /// one lock so a reader never mixes rates and totals from different sampling
-/// ticks (issue #338). Totals are the cumulative sum of the sampled rates
-/// (issue #340) — derived, not read from a second counter, so `rate <= total`
-/// holds by construction and no interleaving can publish an impossible pair.
+/// ticks (issue #338). Totals are the cumulative counters as observed at the
+/// last tick; rates are the delta between consecutive observations (issue
+/// #357) — derived from one counter, so `rate <= total` holds by construction
+/// and no interleaving can publish an impossible pair (issue #340).
 #[derive(Default, Clone, Copy)]
 struct TrafficSnapshot {
     upload_rate: Int,
@@ -133,12 +134,13 @@ struct TrafficSnapshot {
 }
 
 pub struct Statistics {
-    /// Bytes since the last sampler tick. The only global counters the relay
-    /// hot path touches (one relaxed `fetch_add` per direction per chunk);
-    /// totals are accumulated from these at sample time, never double-tracked
-    /// (issue #340).
-    upload_temp: AtomicI,
-    download_temp: AtomicI,
+    /// Cumulative relay byte totals. The only global counters the relay hot
+    /// path touches (one relaxed `fetch_add` per direction per chunk). The
+    /// sampler derives per-interval rates as deltas of consecutive
+    /// observations and never writes these counters, so no relay increment
+    /// can land on the wrong side of a `swap(0)`-style reset (issue #357).
+    upload_total: AtomicI,
+    download_total: AtomicI,
     traffic: Mutex<TrafficSnapshot>,
     /// Keyed by `Uuid` (16 B Copy) — formerly `String`, which heap-allocated a
     /// 36-byte hyphenated representation per insert.  REST handlers parse the
@@ -150,8 +152,8 @@ pub struct Statistics {
 impl Statistics {
     pub fn new() -> Self {
         Self {
-            upload_temp: AtomicI::new(0),
-            download_temp: AtomicI::new(0),
+            upload_total: AtomicI::new(0),
+            download_total: AtomicI::new(0),
             traffic: Mutex::new(TrafficSnapshot::default()),
             connections: DashMap::new(),
             rule_match: Arc::new(RuleMatchCounters::new()),
@@ -159,11 +161,11 @@ impl Statistics {
     }
 
     pub fn add_upload(&self, n: Int) {
-        self.upload_temp.fetch_add(n, Ordering::Relaxed);
+        self.upload_total.fetch_add(n, Ordering::Relaxed);
     }
 
     pub fn add_download(&self, n: Int) {
-        self.download_temp.fetch_add(n, Ordering::Relaxed);
+        self.download_total.fetch_add(n, Ordering::Relaxed);
     }
 
     /// Per-chunk relay accounting: two relaxed atomic adds, no map lookup.
@@ -188,20 +190,24 @@ impl Statistics {
             .map(|entry| Arc::clone(&entry.counters))
     }
 
-    /// Roll the current one-second counters into the values exposed by the
-    /// mihomo `/traffic` stream. All four values are published under one lock
-    /// so `traffic_snapshot` readers see a mutually consistent set; totals are
-    /// accumulated from the swapped rates, so they can never disagree with
-    /// them (issue #340). The hot path stays lock-free — the once-per-second
-    /// ticker plus API readers are the only contenders. The swaps happen under
-    /// the lock so [`Self::snapshot`] never sees in-flight bytes in neither
-    /// (or both of) `_temp` and the accumulated total.
+    /// Roll the cumulative counters into the values exposed by the mihomo
+    /// `/traffic` stream. All four values are published under one lock so
+    /// `traffic_snapshot` readers see a mutually consistent set; rates are the
+    /// delta between consecutive observations of the same counter, so they can
+    /// never disagree with the totals (issue #340). The hot path stays
+    /// lock-free — the once-per-second ticker plus API readers are the only
+    /// contenders. Delta sampling means the ticker only loads the counters
+    /// (issue #357): there is no reset for a concurrent relay `fetch_add` to
+    /// race against, so an increment lands in exactly one interval — this one
+    /// if the load observed it, the next one otherwise.
     pub fn sample_traffic(&self) {
         let mut snap = self.traffic.lock();
-        snap.upload_rate = self.upload_temp.swap(0, Ordering::Relaxed);
-        snap.download_rate = self.download_temp.swap(0, Ordering::Relaxed);
-        snap.upload_total += snap.upload_rate;
-        snap.download_total += snap.download_rate;
+        let upload = self.upload_total.load(Ordering::Relaxed);
+        let download = self.download_total.load(Ordering::Relaxed);
+        snap.upload_rate = upload - snap.upload_total;
+        snap.download_rate = download - snap.download_total;
+        snap.upload_total = upload;
+        snap.download_total = download;
     }
 
     /// `(upload_rate, download_rate, upload_total, download_total)` as of the
@@ -242,16 +248,14 @@ impl Statistics {
         self.connections.remove(&id);
     }
 
-    /// Live cumulative `(upload, download)` totals: bytes already rolled into
-    /// the traffic snapshot plus the not-yet-sampled remainder. Reading both
-    /// parts under the snapshot lock excludes a concurrent `sample_traffic`
-    /// from moving bytes between them mid-read, so the sum is exact and
-    /// monotonic.
+    /// Live cumulative `(upload, download)` totals, read straight from the
+    /// hot-path counters. Each counter is a single monotonic atomic — no
+    /// lock, no split between sampled and unsampled parts — so the values are
+    /// exact and monotonic per direction.
     pub fn snapshot(&self) -> (Int, Int) {
-        let snap = self.traffic.lock();
         (
-            snap.upload_total + self.upload_temp.load(Ordering::Relaxed),
-            snap.download_total + self.download_temp.load(Ordering::Relaxed),
+            self.upload_total.load(Ordering::Relaxed),
+            self.download_total.load(Ordering::Relaxed),
         )
     }
 

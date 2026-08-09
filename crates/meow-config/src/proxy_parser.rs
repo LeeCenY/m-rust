@@ -544,15 +544,19 @@ fn parse_anytls(
 
 /// Parse a `type: hysteria2` proxy block.
 ///
-/// Required fields: `server`, `port`, `password`. Optional fields follow the
-/// mihomo surface supported by the in-tree Rust backend: `up`, `down`,
-/// `obfs: salamander`, `obfs-password`, `ports`, `hop-interval`, `sni`,
-/// `skip-cert-verify`, `fingerprint`, `udp`, and `fast-open`.
+/// Required fields: `server`, `password`, and a port source — either `port`
+/// or a concrete `ports` hopping range (mihomo accepts either, and airport
+/// subscriptions commonly omit `port` when `ports` is set; issue #377).
+/// Optional fields follow the mihomo surface supported by the in-tree Rust
+/// backend: `up`, `down`, `obfs: salamander`, `obfs-password`, `ports`,
+/// `hop-interval`, `sni`, `skip-cert-verify`, `fingerprint`, `udp`, and
+/// `fast-open`.
 ///
 /// # Hard errors (Class A per ADR-0002)
 ///
-/// - missing `server`, `port`, or `password`.
-/// - `port == 0`.
+/// - missing `server` or `password`.
+/// - no usable port: `port` absent (or 0) and `ports` absent or wildcard.
+/// - `port == 0` with no `ports` (mihomo: "invalid port").
 /// - empty `password` — caught downstream by `Hy2Adapter::new`.
 /// - unsupported security/transport options (`gecko`, mTLS, ECH, realm).
 ///
@@ -568,7 +572,11 @@ fn parse_hysteria2(
         .get("server")
         .and_then(|v| v.as_str())
         .ok_or_else(|| format!("hysteria2[{name}]: missing server"))?;
-    let port = required_port(config, &format!("hysteria2[{name}]"))?;
+    let ports = optional_nonempty_str(config, "ports");
+    if let Some(ports) = &ports {
+        validate_hy2_ports(name, ports)?;
+    }
+    let port = hy2_dial_port(name, config, ports.as_deref())?;
     let password = config
         .get("password")
         .and_then(|v| v.as_str())
@@ -601,10 +609,6 @@ fn parse_hysteria2(
         return Err(format!("hysteria2[{name}]: missing obfs-password"));
     }
 
-    let ports = optional_nonempty_str(config, "ports");
-    if let Some(ports) = &ports {
-        validate_hy2_ports(name, ports)?;
-    }
     let hop_interval = parse_hy2_hop_interval(name, config.get("hop-interval"))?;
     let fingerprint = parse_hy2_fingerprint(name, config.get("fingerprint"))?;
     let fast_open = config
@@ -712,6 +716,56 @@ fn parse_hy2_bandwidth(input: &str) -> std::result::Result<u64, String> {
 #[cfg(feature = "hysteria2")]
 fn mbps_to_bytes_per_second(mbps: u64) -> u64 {
     mbps.saturating_mul(1_000_000) / 8
+}
+
+/// Resolve the dial port for a hysteria2 outbound. `port` wins when present
+/// and non-zero; otherwise the first concrete port in the (already validated)
+/// `ports` hopping spec stands in — the hopping socket rewrites every send to
+/// the dial port with the current hop port, so the value is a placeholder
+/// whenever hopping is active. Mirrors mihomo, which errors only when both
+/// `port` and `ports` fail to yield a port (issue #377).
+#[cfg(feature = "hysteria2")]
+fn hy2_dial_port(
+    name: &str,
+    config: &HashMap<String, serde_yaml::Value>,
+    ports: Option<&str>,
+) -> std::result::Result<u16, String> {
+    let explicit = match config.get("port") {
+        None => None,
+        Some(value) => {
+            let raw = value
+                .as_u64()
+                .ok_or_else(|| format!("hysteria2[{name}]: missing port"))?;
+            let port = u16::try_from(raw)
+                .map_err(|_| format!("hysteria2[{name}]: port {raw} exceeds 65535"))?;
+            if port == 0 && ports.is_none() {
+                return Err(format!("hysteria2[{name}]: port must be non-zero"));
+            }
+            (port != 0).then_some(port)
+        }
+    };
+    if let Some(port) = explicit {
+        return Ok(port);
+    }
+    ports.and_then(first_hy2_port).ok_or_else(|| {
+        format!("hysteria2[{name}]: missing port — set 'port' or a concrete 'ports' range")
+    })
+}
+
+/// First concrete port in a validated `ports` spec; `None` for the `*`/`all`
+/// wildcard, which names no dialable port.
+#[cfg(feature = "hysteria2")]
+fn first_hy2_port(ports: &str) -> Option<u16> {
+    let ports = ports.trim();
+    if ports == "*" || ports.eq_ignore_ascii_case("all") {
+        return None;
+    }
+    let part = ports.split(',').next()?.trim();
+    let first = match part.split_once('-') {
+        Some((start, _)) => start.trim(),
+        None => part,
+    };
+    first.parse::<u16>().ok().filter(|p| *p != 0)
 }
 
 #[cfg(feature = "hysteria2")]
@@ -1150,13 +1204,7 @@ fn parse_vless(
         };
         let mut tls_cfg = TlsConfig::new(sni);
         tls_cfg.skip_cert_verify = skip_cert_verify;
-        // Default ALPN to http/1.1 for WebSocket transports (required by
-        // many CDNs like Cloudflare to route to the correct backend).
-        tls_cfg.alpn = if alpn.is_empty() && network == "ws" {
-            vec!["http/1.1".to_string()]
-        } else {
-            alpn
-        };
+        tls_cfg.alpn = default_transport_alpn(network, alpn);
         tls_cfg.fingerprint = client_fingerprint.map(std::string::ToString::to_string);
         tls_cfg.reality = reality;
 
@@ -1372,6 +1420,23 @@ fn decode_raw_url_base64_lenient(s: &str) -> Option<Vec<u8>> {
             .with_decode_allow_trailing_bits(true),
     );
     engine.decode(s).ok()
+}
+
+/// Default the TLS ALPN by transport when the user configures none:
+/// WebSocket CDNs (notably Cloudflare) route on `http/1.1`; gRPC and h2 run
+/// on HTTP/2 and many servers — xray REALITY in particular — reject a client
+/// that does not offer `h2` (issue #377). An explicit `alpn:` always wins.
+/// upstream: mihomo forces `h2` in its gun (gRPC) transport TLS config.
+#[cfg(any(feature = "vless", feature = "vmess"))]
+fn default_transport_alpn(network: &str, alpn: Vec<String>) -> Vec<String> {
+    if !alpn.is_empty() {
+        return alpn;
+    }
+    match network {
+        "ws" => vec!["http/1.1".to_string()],
+        "grpc" | "h2" => vec!["h2".to_string()],
+        _ => alpn,
+    }
 }
 
 /// Parse VLESS `reality-opts` into transport-layer REALITY parameters.
@@ -1607,11 +1672,7 @@ fn parse_vmess(
         };
         let mut tls_cfg = TlsConfig::new(sni);
         tls_cfg.skip_cert_verify = skip_cert_verify;
-        tls_cfg.alpn = if alpn.is_empty() && network == "ws" {
-            vec!["http/1.1".to_string()]
-        } else {
-            alpn
-        };
+        tls_cfg.alpn = default_transport_alpn(network, alpn);
         tls_cfg.fingerprint = client_fingerprint.map(std::string::ToString::to_string);
         let tls_layer =
             TlsLayer::new(&tls_cfg).map_err(|e| format!("vmess: TLS layer error: {e}"))?;
@@ -1907,6 +1968,32 @@ mod tests {
         assert!(decode_raw_url_base64_lenient("!!!not base64!!!").is_none());
     }
 
+    #[cfg(any(feature = "vless", feature = "vmess"))]
+    #[test]
+    fn default_alpn_follows_transport() {
+        // Explicit alpn always wins.
+        assert_eq!(
+            default_transport_alpn("grpc", vec!["custom".to_string()]),
+            vec!["custom".to_string()]
+        );
+        // ws → http/1.1 (CDN routing); grpc/h2 → h2 (HTTP/2 transports —
+        // xray REALITY rejects clients that don't offer it, issue #377).
+        assert_eq!(
+            default_transport_alpn("ws", Vec::new()),
+            vec!["http/1.1".to_string()]
+        );
+        assert_eq!(
+            default_transport_alpn("grpc", Vec::new()),
+            vec!["h2".to_string()]
+        );
+        assert_eq!(
+            default_transport_alpn("h2", Vec::new()),
+            vec!["h2".to_string()]
+        );
+        // Plain TCP keeps ALPN absent.
+        assert!(default_transport_alpn("tcp", Vec::new()).is_empty());
+    }
+
     #[test]
     fn parse_proxy_rejects_port_overflow() {
         let cfg = proxy_config("name: bad\ntype: http\nserver: 1.2.3.4\nport: 65536\n");
@@ -2112,6 +2199,48 @@ tls: true
             panic!("must hard-error");
         };
         assert!(err.contains("port must be non-zero"), "msg: {err}");
+    }
+
+    #[cfg(feature = "hysteria2")]
+    #[test]
+    fn parse_hysteria2_accepts_ports_without_port() {
+        // Airport subscriptions commonly set only a hopping range (issue #377);
+        // mihomo accepts this, so we do too — first concrete port dials.
+        let cfg = hy2_config(
+            "name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\nports: 20000-30000\npassword: secret\n",
+        );
+        assert!(parse_proxy(&cfg).is_ok());
+    }
+
+    #[cfg(feature = "hysteria2")]
+    #[test]
+    fn parse_hysteria2_accepts_zero_port_with_ports() {
+        let cfg = hy2_config(
+            "name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\nport: 0\nports: '443,8443'\npassword: secret\n",
+        );
+        assert!(parse_proxy(&cfg).is_ok());
+    }
+
+    #[cfg(feature = "hysteria2")]
+    #[test]
+    fn parse_hysteria2_rejects_missing_port_and_ports() {
+        let cfg = hy2_config("name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\npassword: secret\n");
+        let Err(err) = parse_proxy(&cfg) else {
+            panic!("must hard-error");
+        };
+        assert!(err.contains("missing port"), "msg: {err}");
+    }
+
+    #[cfg(feature = "hysteria2")]
+    #[test]
+    fn parse_hysteria2_rejects_wildcard_ports_without_port() {
+        let cfg = hy2_config(
+            "name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\nports: '*'\npassword: secret\n",
+        );
+        let Err(err) = parse_proxy(&cfg) else {
+            panic!("must hard-error");
+        };
+        assert!(err.contains("missing port"), "msg: {err}");
     }
 
     #[cfg(feature = "hysteria2")]
