@@ -135,17 +135,59 @@ impl RuleProvider {
 /// Inline providers never appear here — their payload lives in the raw config.
 pub type PrefetchedPayloads = HashMap<String, Vec<u8>>;
 
+/// Resolves a per-provider `proxy:` name (mihomo compat, issue #377) to a
+/// live proxy at load time. Returns `None` for names it cannot resolve.
+pub type ProxyLookup<'a> = &'a dyn Fn(&str) -> Option<Arc<dyn Proxy>>;
+
+/// Effective download proxy for one http provider: an explicit
+/// `proxy: DIRECT` forces a direct fetch, any other explicit name must
+/// resolve via `lookup`, and an absent field keeps the global default
+/// (historically the first proxy in `proxies:`).
+fn effective_download_proxy(
+    cfg: &RawRuleProvider,
+    default: Option<&Arc<dyn Proxy>>,
+    lookup: ProxyLookup<'_>,
+) -> Result<Option<Arc<dyn Proxy>>> {
+    match cfg.proxy.as_deref().map(str::trim) {
+        None | Some("") => Ok(default.cloned()),
+        Some(name) if name.eq_ignore_ascii_case("DIRECT") => Ok(None),
+        Some(name) => lookup(name)
+            .map(Some)
+            .ok_or_else(|| anyhow!("download proxy '{name}' is not a known proxy or group")),
+    }
+}
+
 /// Fetch/read the raw payload bytes of every file/http provider without
 /// parsing them. Failures are logged and skipped; `load_providers_prefetched`
 /// retries any provider missing from the map and reports the error there.
+///
+/// A `proxy:` name `lookup` cannot resolve (prefetch runs before groups and
+/// provider-sourced proxies exist) skips the prefetch quietly — the load
+/// pass retries against the full registry.
 pub fn prefetch_payloads(
     raw_providers: &HashMap<String, RawRuleProvider>,
     cache_dir: Option<&Path>,
-    download_proxy: Option<&Arc<dyn Proxy>>,
+    default_proxy: Option<&Arc<dyn Proxy>>,
+    lookup: ProxyLookup<'_>,
 ) -> PrefetchedPayloads {
     let mut out = HashMap::new();
     for (name, cfg) in raw_providers {
-        match read_payload_bytes(name, cfg, cache_dir, download_proxy) {
+        let download_proxy = if cfg.provider_type == "http" {
+            match effective_download_proxy(cfg, default_proxy, lookup) {
+                Ok(p) => p,
+                Err(e) => {
+                    debug!(
+                        "rule-provider '{}': prefetch skipped ({:#}); \
+                         retried once proxies are built",
+                        name, e
+                    );
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        match read_payload_bytes(name, cfg, cache_dir, download_proxy.as_ref()) {
             Ok(Some(bytes)) => {
                 out.insert(name.clone(), bytes);
             }
@@ -204,6 +246,7 @@ pub fn load_providers(
         cache_dir,
         ctx,
         download_proxy,
+        &|_| None,
         &HashMap::new(),
     )
 }
@@ -215,7 +258,8 @@ pub fn load_providers_prefetched(
     raw_providers: &HashMap<String, RawRuleProvider>,
     cache_dir: Option<&Path>,
     ctx: &ParserContext,
-    download_proxy: Option<&Arc<dyn Proxy>>,
+    default_proxy: Option<&Arc<dyn Proxy>>,
+    lookup: ProxyLookup<'_>,
     prefetched: &PrefetchedPayloads,
 ) -> HashMap<String, Arc<RuleProvider>> {
     let mut out = HashMap::new();
@@ -223,8 +267,19 @@ pub fn load_providers_prefetched(
         return out;
     }
     for (name, cfg) in raw_providers {
+        let download_proxy = if cfg.provider_type == "http" {
+            match effective_download_proxy(cfg, default_proxy, lookup) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!("Failed to load rule-provider '{}': {:#}", name, e);
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
         let payload = prefetched.get(name).map(Vec::as_slice);
-        match load_one(name, cfg, cache_dir, ctx, download_proxy, payload) {
+        match load_one(name, cfg, cache_dir, ctx, download_proxy.as_ref(), payload) {
             Ok(provider) => {
                 debug!(
                     "Loaded rule-provider '{}' ({}/{}): {} entries",
@@ -623,6 +678,94 @@ mod tests {
         ParserContext::empty()
     }
 
+    fn http_cfg(proxy: Option<&str>) -> RawRuleProvider {
+        RawRuleProvider {
+            provider_type: "http".to_string(),
+            behavior: "domain".to_string(),
+            format: Some("yaml".to_string()),
+            url: Some("http://127.0.0.1:1/rules.yaml".to_string()),
+            path: None,
+            interval: None,
+            proxy: proxy.map(str::to_string),
+            payload: None,
+        }
+    }
+
+    fn direct_proxy() -> Arc<dyn Proxy> {
+        let cfg: HashMap<String, serde_yaml::Value> =
+            serde_yaml::from_str("name: d\ntype: direct").unwrap();
+        crate::proxy_parser::parse_proxy(&cfg).unwrap()
+    }
+
+    #[test]
+    fn effective_download_proxy_follows_mihomo_policy() {
+        let d = direct_proxy();
+        // Absent field keeps the global default.
+        assert!(effective_download_proxy(&http_cfg(None), Some(&d), &|_| None)
+            .unwrap()
+            .is_some());
+        // DIRECT (case-insensitive) forces a direct fetch even with a default.
+        assert!(
+            effective_download_proxy(&http_cfg(Some("direct")), Some(&d), &|_| None)
+                .unwrap()
+                .is_none()
+        );
+        // An explicit name resolves via the lookup.
+        let hit = effective_download_proxy(&http_cfg(Some("d")), None, &|n| {
+            (n == "d").then(|| Arc::clone(&d))
+        })
+        .unwrap();
+        assert!(hit.is_some());
+        // An unknown name is an error, never a silent fallback.
+        assert!(effective_download_proxy(&http_cfg(Some("nope")), Some(&d), &|_| None).is_err());
+    }
+
+    #[test]
+    fn http_provider_with_unknown_proxy_name_is_skipped() {
+        let mut providers = HashMap::new();
+        providers.insert("p".to_string(), http_cfg(Some("NoSuch")));
+        // Payload already prefetched — resolution still fails first, so the
+        // provider is skipped rather than loaded via the wrong proxy.
+        let mut prefetched = HashMap::new();
+        prefetched.insert("p".to_string(), b"payload:\n  - example.com\n".to_vec());
+        let out = load_providers_prefetched(&providers, None, &ctx(), None, &|_| None, &prefetched);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn http_provider_with_direct_proxy_loads_prefetched_payload() {
+        let mut providers = HashMap::new();
+        providers.insert("p".to_string(), http_cfg(Some("DIRECT")));
+        let mut prefetched = HashMap::new();
+        prefetched.insert("p".to_string(), b"payload:\n  - example.com\n".to_vec());
+        let out = load_providers_prefetched(&providers, None, &ctx(), None, &|_| None, &prefetched);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out.get("p").unwrap().rule_count(), 1);
+    }
+
+    #[test]
+    fn file_provider_ignores_proxy_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("list.yaml");
+        std::fs::write(&file_path, "payload:\n  - example.com\n").unwrap();
+        let mut providers = HashMap::new();
+        providers.insert(
+            "f".to_string(),
+            RawRuleProvider {
+                provider_type: "file".to_string(),
+                behavior: "domain".to_string(),
+                format: Some("yaml".to_string()),
+                url: None,
+                path: Some(file_path.to_string_lossy().to_string()),
+                interval: None,
+                proxy: Some("NoSuch".to_string()),
+                payload: None,
+            },
+        );
+        let out = load_providers(&providers, Some(dir.path()), &ctx(), None);
+        assert_eq!(out.len(), 1);
+    }
+
     #[test]
     fn yaml_file_provider_loads() {
         let dir = tempfile::tempdir().unwrap();
@@ -638,6 +781,7 @@ mod tests {
                 url: None,
                 path: Some(file_path.to_string_lossy().to_string()),
                 interval: None,
+                proxy: None,
                 payload: None,
             },
         );
@@ -660,6 +804,7 @@ mod tests {
                 url: None,
                 path: None,
                 interval: None,
+                proxy: None,
                 payload: Some(vec!["example.com".to_string(), "+.foo.com".to_string()]),
             },
         );
@@ -679,6 +824,7 @@ mod tests {
             url: None,
             path: None,
             interval: Some(3600),
+            proxy: None,
             payload: Some(vec!["example.com".to_string()]),
         };
         let err = load_inline("p", &cfg, RuleSetBehavior::Domain, &ctx())
@@ -705,6 +851,7 @@ mod tests {
                 url: None,
                 path: Some(file_path.to_string_lossy().to_string()),
                 interval: None,
+                proxy: None,
                 payload: None,
             },
         );
@@ -729,6 +876,7 @@ mod tests {
                 url: None,
                 path: Some(file_path.to_string_lossy().to_string()),
                 interval: None,
+                proxy: None,
                 payload: None,
             },
         );
@@ -748,6 +896,7 @@ mod tests {
                 url: None,
                 path: None,
                 interval: None,
+                proxy: None,
                 payload: None,
             },
         );
@@ -770,6 +919,7 @@ mod tests {
                 url: None,
                 path: Some(file_path.to_string_lossy().to_string()),
                 interval: Some(3600),
+                proxy: None,
                 payload: None,
             },
         );
@@ -824,6 +974,7 @@ mod tests {
                 url: Some(format!("http://{addr}/rules.yaml")),
                 path: None,
                 interval: None,
+                proxy: None,
                 payload: None,
             },
         );
@@ -847,6 +998,7 @@ mod tests {
                 url: None,
                 path: None,
                 interval: None,
+                proxy: None,
                 payload: Some(vec!["example.com".to_string()]),
             },
         );
@@ -859,6 +1011,7 @@ mod tests {
                 url: None,
                 path: None,
                 interval: None,
+                proxy: None,
                 payload: Some(vec!["10.0.0.0/8".to_string()]),
             },
         );

@@ -339,6 +339,11 @@ pub struct RawRuleProvider {
     pub url: Option<String>,
     pub path: Option<String>,
     pub interval: Option<u64>,
+    /// mihomo-compatible download policy for http providers (issue #377):
+    /// the name of a proxy or group to route this provider's fetches
+    /// through, or `DIRECT` to force a direct fetch. Absent = the global
+    /// default (the first proxy in `proxies:`, direct when none).
+    pub proxy: Option<String>,
     /// Inline payload: list of rule strings (only for type=inline).
     pub payload: Option<Vec<String>>,
 }
