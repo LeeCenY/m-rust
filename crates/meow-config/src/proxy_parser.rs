@@ -1204,13 +1204,7 @@ fn parse_vless(
         };
         let mut tls_cfg = TlsConfig::new(sni);
         tls_cfg.skip_cert_verify = skip_cert_verify;
-        // Default ALPN to http/1.1 for WebSocket transports (required by
-        // many CDNs like Cloudflare to route to the correct backend).
-        tls_cfg.alpn = if alpn.is_empty() && network == "ws" {
-            vec!["http/1.1".to_string()]
-        } else {
-            alpn
-        };
+        tls_cfg.alpn = default_transport_alpn(network, alpn);
         tls_cfg.fingerprint = client_fingerprint.map(std::string::ToString::to_string);
         tls_cfg.reality = reality;
 
@@ -1426,6 +1420,23 @@ fn decode_raw_url_base64_lenient(s: &str) -> Option<Vec<u8>> {
             .with_decode_allow_trailing_bits(true),
     );
     engine.decode(s).ok()
+}
+
+/// Default the TLS ALPN by transport when the user configures none:
+/// WebSocket CDNs (notably Cloudflare) route on `http/1.1`; gRPC and h2 run
+/// on HTTP/2 and many servers — xray REALITY in particular — reject a client
+/// that does not offer `h2` (issue #377). An explicit `alpn:` always wins.
+/// upstream: mihomo forces `h2` in its gun (gRPC) transport TLS config.
+#[cfg(any(feature = "vless", feature = "vmess"))]
+fn default_transport_alpn(network: &str, alpn: Vec<String>) -> Vec<String> {
+    if !alpn.is_empty() {
+        return alpn;
+    }
+    match network {
+        "ws" => vec!["http/1.1".to_string()],
+        "grpc" | "h2" => vec!["h2".to_string()],
+        _ => alpn,
+    }
 }
 
 /// Parse VLESS `reality-opts` into transport-layer REALITY parameters.
@@ -1661,11 +1672,7 @@ fn parse_vmess(
         };
         let mut tls_cfg = TlsConfig::new(sni);
         tls_cfg.skip_cert_verify = skip_cert_verify;
-        tls_cfg.alpn = if alpn.is_empty() && network == "ws" {
-            vec!["http/1.1".to_string()]
-        } else {
-            alpn
-        };
+        tls_cfg.alpn = default_transport_alpn(network, alpn);
         tls_cfg.fingerprint = client_fingerprint.map(std::string::ToString::to_string);
         let tls_layer =
             TlsLayer::new(&tls_cfg).map_err(|e| format!("vmess: TLS layer error: {e}"))?;
@@ -1959,6 +1966,32 @@ mod tests {
         assert_eq!(decoded.len(), 32);
         // Garbage is still rejected.
         assert!(decode_raw_url_base64_lenient("!!!not base64!!!").is_none());
+    }
+
+    #[cfg(any(feature = "vless", feature = "vmess"))]
+    #[test]
+    fn default_alpn_follows_transport() {
+        // Explicit alpn always wins.
+        assert_eq!(
+            default_transport_alpn("grpc", vec!["custom".to_string()]),
+            vec!["custom".to_string()]
+        );
+        // ws → http/1.1 (CDN routing); grpc/h2 → h2 (HTTP/2 transports —
+        // xray REALITY rejects clients that don't offer it, issue #377).
+        assert_eq!(
+            default_transport_alpn("ws", Vec::new()),
+            vec!["http/1.1".to_string()]
+        );
+        assert_eq!(
+            default_transport_alpn("grpc", Vec::new()),
+            vec!["h2".to_string()]
+        );
+        assert_eq!(
+            default_transport_alpn("h2", Vec::new()),
+            vec!["h2".to_string()]
+        );
+        // Plain TCP keeps ALPN absent.
+        assert!(default_transport_alpn("tcp", Vec::new()).is_empty());
     }
 
     #[test]

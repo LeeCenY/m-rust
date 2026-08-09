@@ -701,9 +701,11 @@ mod tests {
     fn effective_download_proxy_follows_mihomo_policy() {
         let d = direct_proxy();
         // Absent field keeps the global default.
-        assert!(effective_download_proxy(&http_cfg(None), Some(&d), &|_| None)
-            .unwrap()
-            .is_some());
+        assert!(
+            effective_download_proxy(&http_cfg(None), Some(&d), &|_| None)
+                .unwrap()
+                .is_some()
+        );
         // DIRECT (case-insensitive) forces a direct fetch even with a default.
         assert!(
             effective_download_proxy(&http_cfg(Some("direct")), Some(&d), &|_| None)
