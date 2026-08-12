@@ -1,25 +1,25 @@
 # meow on OpenWrt
 
-Official `.ipk` packages for arm OpenWrt devices are attached to every
+Official `.ipk` packages for aarch64 OpenWrt devices are attached to every
 [GitHub release](https://github.com/madeye/meow-rs/releases) (issue
 [#284](https://github.com/madeye/meow-rs/issues/284)):
 
 | Package | Architectures |
 |---------|---------------|
-| `meow_<ver>_<arch>.ipk` | `aarch64_generic`, `aarch64_cortex-a53`, `aarch64_cortex-a72`, `aarch64_cortex-a76`, `arm_cortex-a7_neon-vfpv4`, `arm_cortex-a8_vfpv3`, `arm_cortex-a9_vfpv3-d16`, `arm_cortex-a15_neon-vfpv4` |
+| `meow_<ver>_<arch>.ipk` | `aarch64_generic`, `aarch64_cortex-a53`, `aarch64_cortex-a72`, `aarch64_cortex-a76` |
 | `luci-app-meow_<ver>_all.ipk` | any (LuCI app, architecture-independent) |
 
 The binaries are fully static musl builds, so they have no library
-dependencies beyond OpenWrt's base system. All 32-bit arm packages contain
-the same `armv7` (vfpv3-d16, no NEON assumed) binary; all aarch64 packages
-contain the same `aarch64` binary — only the opkg `Architecture:` label
-differs so that `opkg` accepts the package on your device.
+dependencies beyond OpenWrt's base system. All aarch64 packages contain
+the same `aarch64` binary — only the opkg `Architecture:` label differs so
+that `opkg` accepts the package on your device.
 
-Feature note: the armv7 binaries are built without the `boring-tls`
-feature (boring-sys does not compile for 32-bit musl targets), so ECH and
-uTLS fingerprinting are unavailable on 32-bit arm; every other `full`
-feature (all protocols, DNS, listeners) is present. aarch64 binaries are
-full-featured.
+Feature note: release binaries use the default meow-app feature set
+(`full` + `boring-tls`), so ECH and uTLS fingerprinting are included.
+
+32-bit arm / MIPS OpenWrt packages are not published: `boring-sys` does not
+build for those targets. Cross-build from source with
+`--no-default-features --features full` if you need them without BoringSSL.
 
 Find your device's architecture with:
 
@@ -27,13 +27,12 @@ Find your device's architecture with:
 . /etc/openwrt_release; echo "$DISTRIB_ARCH"
 ```
 
-For example, a Linksys WRT1900ACS (Marvell Armada 385) is
-`arm_cortex-a9_vfpv3-d16`. If your architecture is not in the table but is a
-superset of one that is (e.g. a NEON-capable core), the closest smaller
-package works — the binary makes no assumptions beyond the baseline listed
-above. Devices of other families (mips, x86) can use the static binaries
-from the release tarballs directly; `x86_64` OpenWrt can also run the
-`x86_64-unknown-linux-musl` tarball binary as-is.
+For example, a Raspberry Pi 4 OpenWrt image is typically
+`aarch64_cortex-a72`. If your architecture is not in the table but is a
+superset of one that is, the closest smaller package works — the binary
+makes no assumptions beyond the aarch64 baseline. Devices of other
+families (32-bit arm, mips, x86) can use a self-built static binary or,
+for `x86_64`, the `x86_64-unknown-linux-musl` release tarball as-is.
 
 ## Install
 
@@ -129,5 +128,7 @@ bash tests/test_openwrt_qemu.sh
 - An opkg feed (per-release ipks only; `opkg update`-able feed may come
   later once this stabilizes).
 - `apk` packages for OpenWrt snapshot/main builds (which replaced opkg).
-- mips builds — blocked on Rust dropping stable `rust-std` for
-  `mipsel-unknown-linux-musl` (see ADR-0007).
+- 32-bit arm / mips release ipks — release artifacts require the default
+  `full` + `boring-tls` feature set; boring-sys does not build for those
+  targets. Build from source with `--no-default-features --features full`
+  if needed.
