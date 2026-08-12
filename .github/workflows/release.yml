@@ -21,28 +21,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # MIPS: tier 3 — no prebuilt rust-std, so nightly + -Zbuild-std via
-          # cross (Docker images carry the soft-float musl toolchain).
-          # boring-tls is off (boring-sys cannot cross-compile for MIPS).
-          # Note: mips musl targets default to dynamically-linked musl
-          # (fine on OpenWrt); traffic counters wrap at 4 GiB on mips32
-          # (no 64-bit atomics — see meow-common/src/atomic.rs).
-          - target: mipsel-unknown-linux-musl
-            runner: ubuntu-latest
-            minimal_budget_bytes: 0
-            minimal_soft_gate: true
-            build_std: true
-            toolchain: nightly
-            cargo_flags: --no-default-features --features full
-            use_cross: true
-          - target: mips-unknown-linux-musl
-            runner: ubuntu-latest
-            minimal_budget_bytes: 0
-            minimal_soft_gate: true
-            build_std: true
-            toolchain: nightly
-            cargo_flags: --no-default-features --features full
-            use_cross: true
+          # Every release target builds with the meow-app default feature set
+          # (`full` + `boring-tls`). Targets that cannot link boring-sys
+          # (MIPS, 32-bit musl, windows-gnu) are intentionally not shipped —
+          # operators who need them can cross-build from source with
+          # `--no-default-features --features full`.
           # Linux musl
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-latest
@@ -59,21 +42,6 @@ jobs:
             openwrt_archs: >-
               aarch64_generic aarch64_cortex-a53 aarch64_cortex-a72
               aarch64_cortex-a76
-          - target: armv7-unknown-linux-musleabihf
-            runner: ubuntu-latest
-            # armv7: soft gate only for now (no ADR-0007 budget yet)
-            minimal_budget_bytes: 0
-            minimal_soft_gate: true
-            # boring-sys is broken on 32-bit musl (bindgen emits time64
-            # `time_t: i64` per musl 1.2, while boring passes i32), so build
-            # without the boring-tls default. Trade-off: no ECH/uTLS
-            # fingerprinting on armv7 — everything else in `full` is present.
-            cargo_flags: --no-default-features --features full
-            # Rust's armv7 musleabihf baseline is vfpv3-d16 without NEON, so
-            # the same binary is safe on every core listed here (#284).
-            openwrt_archs: >-
-              arm_cortex-a7_neon-vfpv4 arm_cortex-a8_vfpv3
-              arm_cortex-a9_vfpv3-d16 arm_cortex-a15_neon-vfpv4
           # Linux GNU
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-latest
@@ -87,23 +55,6 @@ jobs:
             runner: ubuntu-latest
             minimal_budget_bytes: 0
             minimal_soft_gate: true
-          # i686: built via cross (Docker) — its images ship a coherent i686
-          # gcc toolchain. zig 0.13 mistranslates x86 AVX-512 features
-          # (evex512, breaks blake3), and host clang mixes glibc-2.39 headers
-          # with other libcs (__isoc23_* symbol drift). boring-tls off: the
-          # 32-bit-musl time64 bindgen mismatch (see armv7 above) applies.
-          - target: i686-unknown-linux-gnu
-            runner: ubuntu-latest
-            minimal_budget_bytes: 0
-            minimal_soft_gate: true
-            cargo_flags: --no-default-features --features full
-            use_cross: true
-          - target: i686-unknown-linux-musl
-            runner: ubuntu-latest
-            minimal_budget_bytes: 0
-            minimal_soft_gate: true
-            cargo_flags: --no-default-features --features full
-            use_cross: true
           - target: riscv64gc-unknown-linux-musl
             runner: ubuntu-latest
             minimal_budget_bytes: 0
@@ -117,11 +68,6 @@ jobs:
             runner: windows-latest
             minimal_budget_bytes: 0
             minimal_soft_gate: true
-          - target: x86_64-pc-windows-gnu
-            runner: windows-latest
-            minimal_budget_bytes: 0
-            minimal_soft_gate: true
-            cargo_flags: --no-default-features --features full
           - target: i686-pc-windows-msvc
             runner: windows-latest
             minimal_budget_bytes: 0
@@ -141,14 +87,9 @@ jobs:
       - name: Setup Rust toolchain
         shell: bash
         run: |
-          TOOLCHAIN="${{ matrix.toolchain || 'stable' }}"
-          rustup toolchain install "$TOOLCHAIN" --profile minimal --no-self-update
-          rustup default "$TOOLCHAIN"
-          if [ "${{ matrix.build_std }}" = "true" ]; then
-            rustup component add rust-src --toolchain "$TOOLCHAIN"
-          else
-            rustup target add "${{ matrix.target }}" --toolchain "$TOOLCHAIN"
-          fi
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustup target add "${{ matrix.target }}"
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -164,25 +105,14 @@ jobs:
       - run: cargo install --locked cargo-zigbuild
         if: runner.os == 'Linux'
 
-      - name: Install cross-compilation tools
-        if: runner.os == 'Linux'
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cross@0.2.5
-
       - name: Build release binary
         shell: bash
         run: |
-          if [ "${{ matrix.use_cross }}" = "true" ]; then
-            BUILD_STD=""
-            if [ "${{ matrix.build_std }}" = "true" ]; then
-              BUILD_STD="-Zbuild-std=std,panic_abort"
-            fi
-            cross build --release --locked ${{ matrix.cargo_flags }} $BUILD_STD --target ${{ matrix.target }} --bin meow
-          elif [ "${{ runner.os }}" = "Linux" ]; then
-            cargo zigbuild --release --locked ${{ matrix.cargo_flags }} --target ${{ matrix.target }} --bin meow
+          # Default features = full + boring-tls (meow-app/Cargo.toml).
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            cargo zigbuild --release --locked --target ${{ matrix.target }} --bin meow
           else
-            cargo build --release --locked ${{ matrix.cargo_flags }} --target ${{ matrix.target }} --bin meow
+            cargo build --release --locked --target ${{ matrix.target }} --bin meow
           fi
 
       - name: Build minimal release binary (stripped, for size check)
