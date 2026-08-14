@@ -203,8 +203,43 @@ pub fn parse_proxy(
             let adapter = parse_snell(name, config)?;
             Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
         }
+        #[cfg(not(feature = "ss"))]
+        "ss" => Err(feature_gated_proxy_type("ss")),
+        #[cfg(not(feature = "trojan"))]
+        "trojan" => Err(feature_gated_proxy_type("trojan")),
+        #[cfg(not(feature = "vless"))]
+        "vless" => Err(feature_gated_proxy_type("vless")),
+        #[cfg(not(feature = "anytls"))]
+        "anytls" => Err(feature_gated_proxy_type("anytls")),
+        #[cfg(not(feature = "hysteria2"))]
+        "hysteria2" => Err(feature_gated_proxy_type("hysteria2")),
+        #[cfg(not(feature = "vmess"))]
+        "vmess" => Err(feature_gated_proxy_type("vmess")),
+        #[cfg(not(feature = "snell"))]
+        "snell" => Err(feature_gated_proxy_type("snell")),
         _ => Err(format!("unsupported proxy type: {proxy_type}")),
     }
+}
+
+/// Error for a proxy type this codebase implements but which was compiled out
+/// of the running binary. The generic "unsupported proxy type" message made
+/// users think the protocol was missing entirely, when the actual fix is to
+/// use a full-featured build (issue #390).
+#[cfg(not(all(
+    feature = "ss",
+    feature = "trojan",
+    feature = "vless",
+    feature = "anytls",
+    feature = "hysteria2",
+    feature = "vmess",
+    feature = "snell"
+)))]
+fn feature_gated_proxy_type(proxy_type: &str) -> String {
+    format!(
+        "proxy type '{proxy_type}' is not compiled into this build; \
+         use an official release binary or rebuild with `--features full` \
+         (or `--features {proxy_type}`)"
+    )
 }
 
 /// Parse a `type: snell` proxy block.
