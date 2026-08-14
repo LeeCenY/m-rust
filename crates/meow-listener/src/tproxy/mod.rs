@@ -62,23 +62,34 @@ impl TProxyListener {
     }
 
     pub async fn run(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Bind first so a port-0 listen can resolve to the OS-assigned port
+        // before firewall rules are installed against it.
+        let listener = TcpListener::bind(self.listen_addr).await?;
+        self.run_on(listener).await
+    }
+
+    /// Serve on an already-bound socket, letting the caller resolve a
+    /// `port: 0` ephemeral listener to its OS-assigned port first. Firewall
+    /// redirect rules are installed against the socket's actual local port,
+    /// so ephemeral listeners redirect correctly.
+    pub async fn run_on(
+        self,
+        listener: TcpListener,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Collect upstream proxy server IPs for firewall bypass
         let bypass_ips = collect_proxy_server_ips(&self.tunnel);
 
-        // Set up firewall redirect rules (tears down on drop)
-        let _firewall =
-            FirewallGuard::setup(self.listen_addr.port(), self.routing_mark, &bypass_ips)?;
+        let bound_addr = listener.local_addr().unwrap_or(self.listen_addr);
 
-        let listener = TcpListener::bind(self.listen_addr).await?;
-        info!(
-            "TProxy listener '{}' started on {}",
-            self.name, self.listen_addr
-        );
+        // Set up firewall redirect rules (tears down on drop)
+        let _firewall = FirewallGuard::setup(bound_addr.port(), self.routing_mark, &bypass_ips)?;
+
+        info!("TProxy listener '{}' started on {}", self.name, bound_addr);
 
         loop {
             let (stream, src_addr) = listener.accept().await?;
             let tunnel = self.tunnel.clone();
-            let listen_addr = self.listen_addr;
+            let listen_addr = bound_addr;
             let sniffer = self.sniffer.clone();
             let name = self.name.clone();
 

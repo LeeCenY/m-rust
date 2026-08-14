@@ -27,7 +27,7 @@ use proxy_provider::ProxyProvider;
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -1326,6 +1326,40 @@ fn resource_cache_dir_for_config_path_with_home(path: &str, home_dir: Option<Pat
         )
 }
 
+/// Resolve a listener `listen` field plus optional `port`.
+///
+/// `listen` may be:
+/// - an IP literal (`127.0.0.1`, `::`, `0.0.0.0`) — combined with `port`
+/// - a socket address (`127.0.0.1:0`, `[::1]:7890`) — port taken from the
+///   address unless it is `0` and an explicit `port` was also given
+///
+/// Port `0` means the OS picks an ephemeral port at bind time.
+pub(crate) fn resolve_listener_bind(
+    listen: &str,
+    port: Option<u16>,
+) -> Result<(String, u16), anyhow::Error> {
+    let explicit_port = port.unwrap_or(0);
+
+    if listen.parse::<IpAddr>().is_ok() {
+        return Ok((listen.to_string(), explicit_port));
+    }
+
+    if let Ok(addr) = listen.parse::<SocketAddr>() {
+        let listen_port = addr.port();
+        let resolved = match (listen_port, explicit_port) {
+            (0, p) => p,
+            (lp, 0) => lp,
+            (lp, p) if lp == p => lp,
+            (lp, p) => anyhow::bail!("listen '{listen}' port {lp} conflicts with port {p}"),
+        };
+        return Ok((addr.ip().to_string(), resolved));
+    }
+
+    anyhow::bail!(
+        "invalid bind address '{listen}': expected an IP literal or host:port (e.g. 127.0.0.1:0)"
+    )
+}
+
 /// Parse `type:` string from a `listeners:` entry into `ListenerType`.
 /// Hard errors on unknown types (Class A per ADR-0002).
 fn parse_listener_type(s: &str) -> Result<ListenerType, anyhow::Error> {
@@ -1361,17 +1395,21 @@ fn build_named_listeners(
                    tproxy_sni: bool,
                    max_connections: usize|
      -> Result<(), anyhow::Error> {
-        if let Some(existing) = used_ports.get(&port) {
-            anyhow::bail!(
-                "port {port} already used by listener '{existing}' (duplicate port, Class A per ADR-0002)"
-            );
+        // Port 0 is "OS assigns an ephemeral port" — each such listener binds
+        // a distinct port at runtime, so they are not duplicates of each other.
+        if port != 0 {
+            if let Some(existing) = used_ports.get(&port) {
+                anyhow::bail!(
+                    "port {port} already used by listener '{existing}' (duplicate port, Class A per ADR-0002)"
+                );
+            }
+            used_ports.insert(port, name.to_string());
         }
         if !used_names.insert(name.to_string()) {
             anyhow::bail!(
                 "listener name '{name}' already defined (duplicate name, Class A per ADR-0002)"
             );
         }
-        used_ports.insert(port, name.to_string());
         result.push(NamedListener {
             name: name.to_string(),
             listener_type: ltype,
@@ -1383,8 +1421,11 @@ fn build_named_listeners(
         Ok(())
     };
 
-    // Shorthand fields → auto-named listeners (inherit global max-connections)
-    if let Some(port) = raw.mixed_port {
+    // Shorthand fields → auto-named listeners (inherit global max-connections).
+    // Port `0` on a shorthand field means "disabled", matching upstream mihomo
+    // (`mixed-port: 0` is how generated configs turn an inbound off). Ephemeral
+    // ports are an explicit `listeners:`-entry opt-in only.
+    if let Some(port) = raw.mixed_port.filter(|p| *p != 0) {
         add(
             "mixed",
             ListenerType::Mixed,
@@ -1394,7 +1435,7 @@ fn build_named_listeners(
             global_max_conns,
         )?;
     }
-    if let Some(port) = raw.socks_port {
+    if let Some(port) = raw.socks_port.filter(|p| *p != 0) {
         add(
             "socks",
             ListenerType::Socks5,
@@ -1404,7 +1445,7 @@ fn build_named_listeners(
             global_max_conns,
         )?;
     }
-    if let Some(port) = raw.port {
+    if let Some(port) = raw.port.filter(|p| *p != 0) {
         add(
             "http",
             ListenerType::Http,
@@ -1414,7 +1455,7 @@ fn build_named_listeners(
             global_max_conns,
         )?;
     }
-    if let Some(port) = raw.tproxy_port {
+    if let Some(port) = raw.tproxy_port.filter(|p| *p != 0) {
         add(
             "tproxy",
             ListenerType::TProxy,
@@ -1428,7 +1469,7 @@ fn build_named_listeners(
     // Explicit `listeners:` entries
     for raw_l in raw.listeners.as_deref().unwrap_or(&[]) {
         let ltype = parse_listener_type(&raw_l.listener_type)?;
-        let listen = raw_l
+        let listen_raw = raw_l
             .listen
             .as_deref()
             .unwrap_or(if ltype == ListenerType::TProxy {
@@ -1436,13 +1477,14 @@ fn build_named_listeners(
             } else {
                 default_bind
             });
+        let (listen, port) = resolve_listener_bind(listen_raw, raw_l.port)?;
         let tproxy_sni = raw_l.tproxy_sni.unwrap_or(global_tproxy_sni);
         let max_connections = raw_l.max_connections.unwrap_or(global_max_conns);
         add(
             &raw_l.name,
             ltype,
-            raw_l.port,
-            listen,
+            port,
+            &listen,
             tproxy_sni,
             max_connections,
         )?;
@@ -2237,9 +2279,79 @@ mod socket_address_tests {
         assert!(parse_optional_socket_addr("dns.listen", Some("127.0.0.1:70000")).is_err());
         assert!(parse_optional_socket_addr("external-controller", Some("[::1]:9090")).is_ok());
         assert_eq!(
+            parse_optional_socket_addr("dns.listen", Some("127.0.0.1:0")).unwrap(),
+            Some("127.0.0.1:0".parse().unwrap())
+        );
+        assert_eq!(
             parse_optional_socket_addr("dns.listen", None).unwrap(),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod listener_bind_tests {
+    use super::resolve_listener_bind;
+
+    #[test]
+    fn ip_literal_plus_port() {
+        assert_eq!(
+            resolve_listener_bind("127.0.0.1", Some(7890)).unwrap(),
+            ("127.0.0.1".into(), 7890)
+        );
+        assert_eq!(
+            resolve_listener_bind("0.0.0.0", None).unwrap(),
+            ("0.0.0.0".into(), 0)
+        );
+        assert_eq!(
+            resolve_listener_bind("::", Some(7890)).unwrap(),
+            ("::".into(), 7890)
+        );
+    }
+
+    #[test]
+    fn host_port_ephemeral() {
+        assert_eq!(
+            resolve_listener_bind("127.0.0.1:0", None).unwrap(),
+            ("127.0.0.1".into(), 0)
+        );
+        assert_eq!(
+            resolve_listener_bind("[::1]:0", None).unwrap(),
+            ("::1".into(), 0)
+        );
+    }
+
+    #[test]
+    fn host_port_explicit() {
+        assert_eq!(
+            resolve_listener_bind("0.0.0.0:7891", None).unwrap(),
+            ("0.0.0.0".into(), 7891)
+        );
+        assert_eq!(
+            resolve_listener_bind("127.0.0.1:7891", Some(7891)).unwrap(),
+            ("127.0.0.1".into(), 7891)
+        );
+        // listen :0 + explicit port uses the port field
+        assert_eq!(
+            resolve_listener_bind("127.0.0.1:0", Some(7890)).unwrap(),
+            ("127.0.0.1".into(), 7890)
+        );
+    }
+
+    #[test]
+    fn host_port_conflict_errors() {
+        let err = resolve_listener_bind("127.0.0.1:7891", Some(7892)).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("conflicts"), "msg: {msg}");
+        assert!(msg.contains("7891"), "msg: {msg}");
+        assert!(msg.contains("7892"), "msg: {msg}");
+    }
+
+    #[test]
+    fn hostname_is_rejected() {
+        let err = resolve_listener_bind("localhost:0", None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("invalid bind address"), "msg: {msg}");
     }
 }
 

@@ -245,7 +245,10 @@ pub struct RawListener {
     pub name: String,
     #[serde(rename = "type")]
     pub listener_type: String,
-    pub port: u16,
+    /// Optional when `listen` is a `host:port` socket address. `0` (or omitted
+    /// with no port in `listen`) means the OS assigns an ephemeral port at bind.
+    #[serde(default)]
+    pub port: Option<u16>,
     pub listen: Option<String>,
     pub tproxy_sni: Option<bool>,
     /// Per-listener override of the global `max-connections` cap. `0`
