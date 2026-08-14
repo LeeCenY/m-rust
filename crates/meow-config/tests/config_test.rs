@@ -996,3 +996,36 @@ rules:
     let config = load_config_from_str(yaml).await.unwrap();
     assert_eq!(config.rules.len(), 2);
 }
+
+#[tokio::test]
+async fn test_expected_status_integer_accepted_end_to_end() {
+    // issue #390: `expected-status: 204` (unquoted integer, as documented)
+    // used to abort config load with "invalid type: integer `204`, expected
+    // a string" — in both proxy-groups and proxy-provider health-checks.
+    let yaml = r#"
+proxies:
+  - name: p1
+    type: ss
+    server: 127.0.0.1
+    port: 8388
+    cipher: aes-256-gcm
+    password: test
+proxy-groups:
+  - name: auto
+    type: url-test
+    proxies: [p1]
+    url: http://www.gstatic.com/generate_204
+    interval: 300
+    expected-status: 204
+proxy-providers:
+  prov:
+    type: file
+    path: /nonexistent/meow-issue-390-provider.yaml
+    health-check:
+      enable: true
+      interval: 300
+      expected-status: 204
+"#;
+    let config = load_config_from_str(yaml).await.unwrap();
+    assert!(config.proxies.contains_key("auto"));
+}
