@@ -1509,11 +1509,13 @@ fn parse_vless_reality_opts(
     let mut public_key = [0u8; 32];
     public_key.copy_from_slice(&public_key_bytes);
 
+    // Subscription generators (e.g. Clash Verge) emit `short-id: null` when
+    // the server has no short-id; mihomo treats it as absent (#388).
     let short_id_str = match opts.get("short-id") {
+        None | Some(serde_yaml::Value::Null) => "",
         Some(value) => value
             .as_str()
             .ok_or_else(|| "vless: reality-opts.short-id must be a hex string".to_string())?,
-        None => "",
     };
     let short_id_vec = parse_reality_short_id(short_id_str)?;
     let mut short_id = [0u8; 8];

@@ -1516,10 +1516,15 @@ async fn build_config(
         .parse::<TunnelMode>()
         .unwrap_or(TunnelMode::Rule);
     let log_level = raw.log_level.clone().unwrap_or_else(|| "info".to_string());
-    let bind_address = raw
-        .bind_address
-        .clone()
-        .unwrap_or_else(|| "127.0.0.1".to_string());
+    // mihomo (and Clash Verge output) use `bind-address: '*'` as the
+    // all-interfaces wildcard; normalize it here so listeners never see the
+    // raw `*`, which is not an IP literal (#388). Dual-stack wildcard stays
+    // spellable as `'::'`.
+    let bind_address = match raw.bind_address.as_deref() {
+        None => "127.0.0.1".to_string(),
+        Some("*" | "") => "0.0.0.0".to_string(),
+        Some(addr) => addr.to_string(),
+    };
 
     let general = GeneralConfig {
         mode,
@@ -2352,6 +2357,48 @@ mod listener_bind_tests {
         let err = resolve_listener_bind("localhost:0", None).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("invalid bind address"), "msg: {msg}");
+    }
+}
+
+#[cfg(test)]
+mod bind_address_tests {
+    use super::load_config_from_str;
+
+    // Regression tests for #388: mihomo/Clash Verge configs use
+    // `bind-address: '*'` as the all-interfaces wildcard; feeding the raw
+    // `*` to the listener's IpAddr parse was a fatal startup error.
+
+    #[tokio::test]
+    async fn wildcard_star_normalizes_to_unspecified_ipv4() {
+        let config = load_config_from_str("mixed-port: 7890\nallow-lan: true\nbind-address: '*'\n")
+            .await
+            .expect("bind-address '*' must be accepted");
+        assert_eq!(config.general.bind_address, "0.0.0.0");
+        assert_eq!(config.listeners.bind_address, "0.0.0.0");
+    }
+
+    #[tokio::test]
+    async fn empty_bind_address_normalizes_to_unspecified_ipv4() {
+        let config = load_config_from_str("allow-lan: true\nbind-address: ''\n")
+            .await
+            .expect("empty bind-address must be accepted");
+        assert_eq!(config.general.bind_address, "0.0.0.0");
+    }
+
+    #[tokio::test]
+    async fn explicit_bind_address_is_preserved() {
+        let config = load_config_from_str("allow-lan: true\nbind-address: '::'\n")
+            .await
+            .expect("explicit bind-address must load");
+        assert_eq!(config.general.bind_address, "::");
+    }
+
+    #[tokio::test]
+    async fn default_bind_address_is_loopback() {
+        let config = load_config_from_str("mixed-port: 7890\n")
+            .await
+            .expect("minimal config must load");
+        assert_eq!(config.general.bind_address, "127.0.0.1");
     }
 }
 
