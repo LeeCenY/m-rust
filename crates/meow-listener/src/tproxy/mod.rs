@@ -86,6 +86,19 @@ impl TProxyListener {
 
         info!("TProxy listener '{}' started on {}", self.name, bound_addr);
 
+        // Scope decision for the pf path (#248): the managed ruleset
+        // intercepts loopback-traversing IPv4 TCP only; steering real
+        // outbound (en0) traffic stays a manual, documented pf detour rather
+        // than something meow rewrites the host's pf config for. Surface that
+        // at startup so "tproxy is on but my browser isn't proxied" is
+        // explained by the log, not a silent surprise.
+        #[cfg(target_os = "macos")]
+        info!(
+            "TProxy on macOS intercepts loopback IPv4 TCP only; real outbound \
+             traffic needs the manual route-to detour (docs/tproxy-macos.md) — \
+             for full transparent proxying use the TUN inbound (docs/tun.md)"
+        );
+
         loop {
             let (stream, src_addr) = listener.accept().await?;
             let tunnel = self.tunnel.clone();
