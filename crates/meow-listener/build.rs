@@ -93,18 +93,23 @@ fn fetch_with_script(outdir: &Path) -> Result<(), String> {
 
 fn fetch_with_python(outdir: &Path) -> Result<(), String> {
     let arch = wintun_arch()?;
+    // `NamedTemporaryFile` stays open on Windows and the second open of the
+    // same path raises WinError 32. mkstemp + close, then unlink after the
+    // zip handle is dropped.
     let py = r#"
 import hashlib, os, sys, tempfile, urllib.request, zipfile
 url, expect, arch, outdir = sys.argv[1:5]
 os.makedirs(outdir, exist_ok=True)
-tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+fd, tmp = tempfile.mkstemp(suffix=".zip")
+os.close(fd)
 try:
-    with urllib.request.urlopen(url) as src, open(tmp.name, "wb") as dst:
+    with urllib.request.urlopen(url) as src, open(tmp, "wb") as dst:
         dst.write(src.read())
-    digest = hashlib.sha256(open(tmp.name, "rb").read()).hexdigest()
+    with open(tmp, "rb") as f:
+        digest = hashlib.sha256(f.read()).hexdigest()
     if digest != expect:
         raise SystemExit(f"SHA-256 mismatch: expected {expect}, got {digest}")
-    with zipfile.ZipFile(tmp.name) as zf:
+    with zipfile.ZipFile(tmp) as zf:
         src_name = f"wintun/bin/{arch}/wintun.dll"
         with zf.open(src_name) as src, open(os.path.join(outdir, "wintun.dll"), "wb") as dst:
             dst.write(src.read())
@@ -114,7 +119,10 @@ try:
         except KeyError:
             pass
 finally:
-    os.unlink(tmp.name)
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
 "#;
     for bin in ["python3", "python"] {
         match Command::new(bin)
