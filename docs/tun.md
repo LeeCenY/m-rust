@@ -1,6 +1,6 @@
 # TUN inbound — transparent proxy on Windows (and everywhere else)
 
-Last updated: 2026-07-15. Tracks the `listener-tun` feature (issue
+Last updated: 2026-08-17. Tracks the `listener-tun` feature (issue
 [#326](https://github.com/madeye/meow-rs/issues/326)).
 Audience: users who want system-wide transparent proxying on a platform
 without a tproxy/REDIRECT firewall — Windows first and foremost. The same
@@ -8,8 +8,8 @@ inbound works on Linux and macOS.
 
 The TUN inbound creates an L3 network device (`wintun` on Windows, `tun` on
 Linux, `utun` on macOS), terminates the raw IP packets in a userspace TCP/IP
-stack ([`netstack-smoltcp`](https://crates.io/crates/netstack-smoltcp),
-backed by [smoltcp](https://crates.io/crates/smoltcp)), and dispatches the
+stack ([lwIP](https://github.com/madeye/lwip), via the in-tree tun2socks
+bindings), and dispatches the
 resulting TCP/UDP flows through meow's normal routing engine — rules, proxy
 groups, statistics, and the REST API all behave exactly as they do for the
 other inbounds.
@@ -41,10 +41,13 @@ rules:
 
 Then:
 
-1. **Windows**: place [`wintun.dll`](https://www.wintun.net/) next to
-   `meow.exe` (matching your architecture, e.g. `amd64`) and run the shell
-   elevated ("Run as administrator"). **Linux/macOS**: run as root or grant
-   `CAP_NET_ADMIN`.
+1. **Windows**: official release zips already contain [`wintun.dll`](https://www.wintun.net/)
+   next to `meow.exe`. From-source builds embed the official signed DLL in
+   `meow.exe` and extract it on first TUN start if no sidecar is found
+   (override the compile-time file with `MEOW_WINTUN_DLL=`). You can still
+   fetch a sidecar with `scripts/fetch-wintun.sh --target x86_64-pc-windows-msvc --outdir .`.
+   Run the shell elevated ("Run as administrator"). **Linux/macOS**: run as root
+   or grant `CAP_NET_ADMIN`.
 2. Point the OS resolver at an address **inside the fake-ip range**, e.g.
    `198.18.0.2`. On Windows:
 

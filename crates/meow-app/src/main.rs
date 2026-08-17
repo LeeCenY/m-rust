@@ -1034,10 +1034,14 @@ async fn run(
                     tunnel.set_tun_handle(handle).await;
                 }
                 Ok(Ok(meow_listener::TunReady::Failed(msg))) => {
-                    error!(
-                        "TUN listener failed to start: {msg} — \
-                         check permissions / admin / CAP_NET_ADMIN"
-                    );
+                    if msg.contains("wintun.dll") {
+                        error!("TUN listener failed to start: {msg}");
+                    } else {
+                        error!(
+                            "TUN listener failed to start: {msg} — \
+                             check permissions / admin / CAP_NET_ADMIN"
+                        );
+                    }
                     handle.abort();
                 }
                 Ok(Err(_)) => {
