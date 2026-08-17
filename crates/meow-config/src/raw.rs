@@ -216,8 +216,14 @@ pub struct RawTun {
     pub mtu: Option<u16>,
     /// CIDR assigned to the device, e.g. `172.19.0.1/30` (default).
     pub inet4_address: Option<String>,
-    /// Install the fake-IP-range route on startup. Default true.
-    pub auto_route: Option<bool>,
+    /// Route installation on startup. Accepts the mihomo boolean
+    /// (`true` = fake-IP scope, `false` = off) plus the #375 mode strings
+    /// `fake-ip` and `global`. Default true (fake-IP scope).
+    pub auto_route: Option<RawAutoRoute>,
+    /// Physical interface outbound sockets bind to in `auto-route: global`
+    /// mode (loop avoidance, #375). Auto-detected from the default route
+    /// when omitted. Ignored outside global mode.
+    pub outbound_interface: Option<String>,
     /// DNS hijack targets. meow-rs v1 hijacks all UDP :53 flows entering
     /// the device whenever this list is non-empty; entries with a port
     /// other than 53 warn and are ignored.
@@ -236,6 +242,15 @@ pub struct RawTun {
     pub route_exclude_address: Option<serde_yaml::Value>,
     pub include_uid: Option<serde_yaml::Value>,
     pub exclude_uid: Option<serde_yaml::Value>,
+}
+
+/// `tun.auto-route` value: mihomo's boolean or a #375 mode string.
+/// Untagged so `auto-route: true` and `auto-route: global` both parse.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(untagged)]
+pub enum RawAutoRoute {
+    Enabled(bool),
+    Mode(String),
 }
 
 /// One entry in the `listeners:` array.

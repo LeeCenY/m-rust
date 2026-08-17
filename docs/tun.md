@@ -75,8 +75,8 @@ side-steps the entire problem class:
 
 The trade-off: **traffic that never does a DNS lookup (IP-literal
 connections) is not captured.** For domain-based traffic — the overwhelming
-majority — capture is complete. Global capture ("route everything") needs
-outbound loop protection and is tracked as follow-up work.
+majority — capture is complete. Global capture ("route everything") is the
+opt-in `auto-route: global` mode below (#375).
 
 Consequences:
 
@@ -88,6 +88,63 @@ Consequences:
   stack itself — `ping` to a fake IP confirms the tun is up, but is not an
   end-to-end probe of the remote host.
 
+## Global route mode — `auto-route: global` (experimental, Linux-only)
+
+Tracked on [#375](https://github.com/madeye/meow-rs/issues/375). Routes
+**all IPv4 traffic** into the device instead of just the fake-ip range, so
+IP-literal connections are captured too:
+
+```yaml
+tun:
+  enable: true
+  auto-route: global
+  # outbound-interface: eth0   # optional; auto-detected from the default route
+  dns-hijack:
+    - any:53
+```
+
+How each loop-avoidance piece works:
+
+1. **Split default routes.** `auto-route: global` installs `0.0.0.0/1` and
+   `128.0.0.0/1` into the device. The two /1s are more specific than the
+   physical `0.0.0.0/0`, so the original default route is never touched and
+   teardown is a plain route delete — no restore step that can be lost to a
+   crash.
+2. **Outbound interface binding.** Every outbound socket meow creates (proxy
+   upstream dials, DIRECT, marked sockets) is bound to the physical
+   interface with `SO_BINDTODEVICE` *before* connect/bind, so its packets
+   take the physical route regardless of the routing table. The interface is
+   `tun.outbound-interface` if set, otherwise auto-detected from
+   `/proc/net/route` **before** the split defaults go in. If the binding
+   cannot be installed, startup **fails closed** — no default routes are
+   installed without loop avoidance.
+3. **Own-resolver hostname dials.** Proxy-server domains are resolved
+   through meow's resolver hook (installed at startup), not libc's
+   `getaddrinfo`, so those lookups don't depend on the OS resolver's
+   routing either.
+
+Scope and caveats:
+
+- **Linux-only for now.** macOS (`IP_BOUND_IF`) and Windows
+  (`IP_UNICAST_IF`) bindings are follow-ups on #375; `auto-route: global`
+  on those platforms is a startup error. On Windows the fake-ip mode
+  remains the supported transparent path.
+- IPv4 only, matching the rest of the TUN v1 flow (no `inet6-address`).
+- `fake-ip` DNS mode is still recommended so domain rules match; global
+  mode adds IP-literal capture on top rather than replacing the DNS flow.
+- Requires root/`CAP_NET_ADMIN` like the rest of the TUN inbound.
+
+Verification on a Linux host (or VM):
+
+```bash
+sudo ./meow -f config.yaml            # global mode active
+curl 1.1.1.1                          # IP literal — captured (check meow logs)
+ip route get 1.1.1.1                  # shows the tun device
+curl https://example.com              # domain flow — still captured
+# teardown: stop meow, then confirm both /1 routes are gone:
+ip route | grep -c '/1 dev' # → 0
+```
+
 ## `tun:` reference
 
 | Field | Default | Notes |
@@ -96,7 +153,8 @@ Consequences:
 | `device` | platform-chosen | Adapter name. macOS always auto-assigns `utunN`. |
 | `mtu` | `1500` | Hard error below 1280 (userspace-stack minimum). |
 | `inet4-address` | `172.19.0.1/30` | CIDR assigned to the device. |
-| `auto-route` | `true` | Install the fake-ip-range route at startup, remove on shutdown. |
+| `auto-route` | `true` | What to route into the device at startup (removed on shutdown): `true`/`fake-ip` = the fake-ip range; `global` = all IPv4 (experimental, Linux-only, see above); `false` = nothing. |
+| `outbound-interface` | auto-detect | Physical interface outbound sockets bind to in `global` mode. Ignored otherwise. |
 | `dns-hijack` | off | List of targets; any `:53` entry turns on in-process answering of UDP :53 flows entering the device. Non-`:53` entries warn and are ignored. |
 | `udp-timeout` | `60` | Seconds of idle before a UDP flow is evicted. |
 

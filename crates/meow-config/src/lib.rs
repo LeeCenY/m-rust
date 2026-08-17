@@ -134,9 +134,28 @@ pub struct TunConfig {
     /// Address + prefix assigned to the device.
     pub inet4_address: ipnet::Ipv4Net,
     pub auto_route: bool,
+    /// Which routes `auto-route` installs (#375). Only meaningful when
+    /// `auto_route` is true.
+    pub route_mode: TunRouteMode,
+    /// Physical interface outbound sockets bind to in global mode; `None`
+    /// = auto-detect from the default route at listener startup.
+    pub outbound_interface: Option<String>,
     /// True when `dns-hijack` contains at least one usable (`:53`) entry.
     pub dns_hijack: bool,
     pub udp_timeout: std::time::Duration,
+}
+
+/// Scope of the routes `tun.auto-route` installs (#375).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TunRouteMode {
+    /// v1 behavior: route only the fake-IP range into the device. Loop-free
+    /// by construction; IP-literal traffic is not captured.
+    #[default]
+    FakeIp,
+    /// Route all IPv4 traffic into the device (split default routes) and
+    /// bind outbound sockets to the physical interface for loop avoidance.
+    /// Experimental; currently Linux-only.
+    Global,
 }
 
 impl Default for TunConfig {
@@ -148,6 +167,8 @@ impl Default for TunConfig {
             // mihomo's default TUN subnet.
             inet4_address: "172.19.0.1/30".parse().expect("static CIDR parses"),
             auto_route: true,
+            route_mode: TunRouteMode::FakeIp,
+            outbound_interface: None,
             dns_hijack: false,
             udp_timeout: std::time::Duration::from_secs(60),
         }
@@ -227,12 +248,39 @@ pub fn parse_tun_config(raw: Option<&raw::RawTun>) -> Result<TunConfig, anyhow::
         None => defaults.udp_timeout.as_secs(),
     });
 
+    // `auto-route` (#375): mihomo boolean, or a mode string selecting what
+    // gets routed. `true` keeps the loop-free v1 fake-IP scope.
+    let (auto_route, route_mode) = match r.auto_route.as_ref() {
+        None => (defaults.auto_route, defaults.route_mode),
+        Some(raw::RawAutoRoute::Enabled(on)) => (*on, TunRouteMode::FakeIp),
+        Some(raw::RawAutoRoute::Mode(s)) => match s.as_str() {
+            "fake-ip" => (true, TunRouteMode::FakeIp),
+            "global" => (true, TunRouteMode::Global),
+            other => {
+                return Err(anyhow::anyhow!(
+                    "tun.auto-route: unknown value '{other}' (expected true, false, \
+                     fake-ip, or global)"
+                ));
+            }
+        },
+    };
+
+    let outbound_interface = r.outbound_interface.clone().filter(|s| !s.is_empty());
+    if outbound_interface.is_some() && route_mode != TunRouteMode::Global {
+        warn!(
+            "tun.outbound-interface: only used with 'auto-route: global'; \
+             ignored in fake-ip mode"
+        );
+    }
+
     Ok(TunConfig {
         enable: r.enable,
         device: r.device.clone().filter(|s| !s.is_empty()),
         mtu,
         inet4_address,
-        auto_route: r.auto_route.unwrap_or(defaults.auto_route),
+        auto_route,
+        route_mode,
+        outbound_interface,
         dns_hijack,
         udp_timeout,
     })
