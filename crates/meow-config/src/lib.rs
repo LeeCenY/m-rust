@@ -143,6 +143,11 @@ pub struct TunConfig {
     /// True when `dns-hijack` contains at least one usable (`:53`) entry.
     pub dns_hijack: bool,
     pub udp_timeout: std::time::Duration,
+    /// Cap on concurrent TUN TCP flows. Inherited from the top-level
+    /// `max-connections` key (default 256; `0` = unlimited). The accept
+    /// loop has no listen-queue back-pressure of its own — this is what
+    /// stops a reconnect storm from spawning unbounded `handle_tcp` tasks.
+    pub max_connections: usize,
 }
 
 /// Scope of the routes `tun.auto-route` installs (#375).
@@ -171,6 +176,7 @@ impl Default for TunConfig {
             outbound_interface: None,
             dns_hijack: false,
             udp_timeout: std::time::Duration::from_secs(60),
+            max_connections: 256,
         }
     }
 }
@@ -181,7 +187,10 @@ const TUN_MIN_MTU: u16 = 1280;
 
 /// Parse and validate the raw `tun:` block. Returns `TunConfig::default()`
 /// (disabled) when the block is absent.
-pub fn parse_tun_config(raw: Option<&raw::RawTun>) -> Result<TunConfig, anyhow::Error> {
+pub fn parse_tun_config(
+    raw: Option<&raw::RawTun>,
+    global_max_connections: Option<usize>,
+) -> Result<TunConfig, anyhow::Error> {
     let Some(r) = raw else {
         return Ok(TunConfig::default());
     };
@@ -283,6 +292,7 @@ pub fn parse_tun_config(raw: Option<&raw::RawTun>) -> Result<TunConfig, anyhow::
         outbound_interface,
         dns_hijack,
         udp_timeout,
+        max_connections: global_max_connections.unwrap_or(defaults.max_connections),
     })
 }
 
@@ -1709,7 +1719,7 @@ async fn build_config(
     };
 
     // TUN inbound (issue #326).
-    let tun = parse_tun_config(raw.tun.as_ref())?;
+    let tun = parse_tun_config(raw.tun.as_ref(), raw.max_connections)?;
 
     // API config
     let external_ui = raw

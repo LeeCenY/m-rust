@@ -3,10 +3,17 @@
 //! This is the transparent-proxy path for platforms without a
 //! tproxy/REDIRECT firewall — Windows first and foremost — and works the
 //! same on Linux and macOS. A `tun-rs` device receives raw IP packets; the
-//! `netstack-smoltcp` userspace TCP/IP stack (smoltcp-backed, the same
-//! netstack clash-rs uses) terminates them and hands us ordinary
-//! `AsyncRead + AsyncWrite` streams (TCP) and a packet-level UDP socket,
-//! which are dispatched into the tunnel exactly like every other inbound.
+//! lwIP userspace TCP/IP stack ([`lwip`](https://github.com/madeye/lwip))
+//! terminates them and hands us ordinary `AsyncRead + AsyncWrite` streams
+//! (TCP) and a packet-level UDP socket, which are dispatched into the
+//! tunnel exactly like every other inbound.
+//!
+//! lwIP's accept hook runs only after the TCP handshake, so a SYN-only
+//! packet never becomes a `TcpStream`. PCB / window / heap caps live in
+//! that crate's `lwipopts.h` (`MEMP_NUM_TCP_PCB`, `TCP_WND`, `MEM_SIZE`).
+//! We still wait for the first payload byte before rule-match / stats /
+//! DIRECT — empty ESTABLISHED sockets (Office reconnects) never enter
+//! `handle_tcp`.
 //!
 //! ## Loop freedom (v1: fake-IP-scoped capture)
 //!
@@ -34,10 +41,11 @@
 //! connect/bind, and hostname dials resolve through meow's own resolver
 //! hook. Startup fails closed if the binding cannot be installed.
 //!
-//! On Windows the device is a wintun adapter: `wintun.dll` must be present
-//! next to the binary (or on the DLL search path) and the process must run
-//! elevated. On Linux/macOS creating the device requires root
-//! (CAP_NET_ADMIN).
+//! On Windows the device is a Wintun adapter. `wintun.dll` is resolved next
+//! to the executable (official Windows zips ship it there), then the working
+//! directory; if neither exists the official signed DLL embedded in the
+//! binary is written out. The process must run elevated. On Linux/macOS
+//! creating the device requires root (CAP_NET_ADMIN).
 
 mod device;
 mod dns;
@@ -45,10 +53,13 @@ mod dns;
 mod local_dns;
 mod route;
 mod udp;
+#[cfg(any(test, target_os = "windows"))]
+mod wintun;
 
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -57,9 +68,18 @@ use futures::StreamExt;
 use ipnet::Ipv4Net;
 use meow_common::{ConnType, Metadata, Network, ProxyConn};
 use meow_tunnel::Tunnel;
-use netstack_smoltcp::{StackBuilder, TcpStream};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
+use tokio::sync::Semaphore;
+use tokio::time::timeout;
 use tracing::{debug, info, warn};
+
+/// How long a TUN TCP socket may sit after the handshake with no payload
+/// before we drop it. SYN scans and half-open reconnects never become
+/// meow connections.
+const TUN_PAYLOAD_WAIT: Duration = crate::DEFAULT_HANDSHAKE_TIMEOUT;
+/// First-read size when waiting for real traffic. Large enough to pull a
+/// TLS ClientHello record header + a bit of payload in one shot.
+const TUN_FIRST_READ: usize = 256;
 
 use route::RouteGuard;
 
@@ -126,6 +146,9 @@ pub struct TunListenerConfig {
     pub dns_hijack: bool,
     /// Idle timeout for UDP flows (flow-table eviction).
     pub udp_timeout: Duration,
+    /// Cap on concurrent TUN TCP handler tasks. Inherited from the
+    /// top-level `max-connections` key (default 256; `0` = unlimited).
+    pub max_connections: usize,
 }
 
 /// Which routes `auto_route` installs (#375).
@@ -285,6 +308,16 @@ impl TunListener {
 
         let cfg = &self.cfg;
 
+        // Windows: sidecar wintun.dll next to the exe / in cwd, else extract
+        // the official DLL embedded in this binary. Fail before the retry
+        // loop so a missing library is not a generic device-create error.
+        #[cfg(target_os = "windows")]
+        let wintun_file = {
+            let path = wintun::resolve_wintun_dll()?;
+            info!("using Wintun library {}", path.display());
+            path.to_string_lossy().into_owned()
+        };
+
         // Try up to 5 device names and IPs in case the previous instance
         // left a stale adapter that hasn't been cleaned up yet (common on
         // Windows after an unclean shutdown).  After the first retry fails,
@@ -298,6 +331,7 @@ impl TunListener {
         let mut device: Option<tun_rs::AsyncDevice> = None;
         let mut dev_name = String::new();
         let mut used_addr = base_addr;
+        let mut last_err: Option<String>;
 
         for attempt in 0..MAX_TUN_RETRIES {
             let name = device_name_for_attempt(cfg.device.as_deref(), attempt);
@@ -316,6 +350,8 @@ impl TunListener {
             // borrow `cfg` across the closure boundary.
             let mtu = cfg.mtu;
             let name_for_closure = name.clone();
+            #[cfg(target_os = "windows")]
+            let wintun_file = wintun_file.clone();
 
             let display_name = name.as_deref().unwrap_or("<platform default>");
             info!(
@@ -333,6 +369,12 @@ impl TunListener {
                 if let Some(n) = &name_for_closure {
                     builder = builder.name(n);
                 }
+                // Pin the Wintun DLL we resolved above so tun-rs does not
+                // walk the process DLL search path.
+                #[cfg(target_os = "windows")]
+                {
+                    builder = builder.wintun_file(wintun_file).wintun_log(true);
+                }
                 builder.build_async()
             })
             .await
@@ -347,18 +389,21 @@ impl TunListener {
                 }
                 Ok(Err(e)) => {
                     warn!("failed to create TUN device '{}': {e}", display_name);
+                    last_err = Some(e.to_string());
                 }
                 Err(join_err) => {
                     warn!(
                         "spawn_blocking for TUN device '{}' panicked: {join_err}",
                         display_name
                     );
+                    last_err = Some(join_err.to_string());
                 }
             }
 
             if attempt + 1 >= MAX_TUN_RETRIES {
+                let detail = last_err.map(|e| format!(": {e}")).unwrap_or_default();
                 return Err(Box::new(io::Error::other(format!(
-                    "failed to create TUN device after {MAX_TUN_RETRIES} attempts"
+                    "failed to create TUN device after {MAX_TUN_RETRIES} attempts{detail}"
                 ))));
             }
         }
@@ -529,22 +574,15 @@ impl TunListener {
             None
         };
 
-        // ICMP rides on the TCP interface (echo replies are answered by
-        // smoltcp itself), hence tcp+icmp+udp; with tcp and udp enabled the
-        // runner/listener/socket options are always populated.
+        // lwIP answers ICMP echo itself. The core task is spawned inside
+        // `NetStack::new` (one live stack per process — await `core_done`
+        // before building a successor, e.g. on config reload).
         let t_stack = Instant::now();
-        let (stack, runner, udp_socket, tcp_listener) = StackBuilder::default()
-            .mtu(usize::from(cfg.mtu))
-            .enable_tcp(true)
-            .enable_udp(true)
-            .enable_icmp(true)
-            .build()?;
-        let runner = runner.expect("netstack runner (TCP enabled)");
-        let mut tcp_listener = tcp_listener.expect("netstack TCP listener (TCP enabled)");
-        let udp_socket = udp_socket.expect("netstack UDP socket (UDP enabled)");
+        let (stack, mut tcp_listener, udp_socket) =
+            lwip::NetStack::new().map_err(|e| io::Error::other(format!("lwIP netstack: {e}")))?;
 
         let stack_ms = t_stack.elapsed().as_secs_f64() * 1000.0;
-        info!("netstack built in {stack_ms:.0}ms");
+        info!("lwIP netstack built in {stack_ms:.0}ms");
 
         let mut tasks = TaskGroup::new();
 
@@ -560,9 +598,6 @@ impl TunListener {
             });
         }
 
-        tasks.spawn(async move {
-            let _ = runner.await;
-        });
         let (mut pump_in, mut pump_out) = device::spawn_pumps(device, stack);
         tasks.push(&pump_in);
         tasks.push(&pump_out);
@@ -576,10 +611,21 @@ impl TunListener {
         ));
 
         let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let max_conn = cfg.max_connections;
         info!(
             "TUN listener '{}' started on device '{dev_name}' ({}/{}, mtu {}, auto-route: {}, \
-             dns-hijack: {}, total startup {total_ms:.0}ms)",
-            self.name, used_addr, prefix, cfg.mtu, cfg.auto_route, cfg.dns_hijack
+             dns-hijack: {}, max-connections: {}, stack: lwip, total startup {total_ms:.0}ms)",
+            self.name,
+            used_addr,
+            prefix,
+            cfg.mtu,
+            cfg.auto_route,
+            cfg.dns_hijack,
+            if max_conn == 0 {
+                "unlimited".to_string()
+            } else {
+                max_conn.to_string()
+            },
         );
 
         // Signal readiness: device, stack, and child tasks are all up.
@@ -591,6 +637,13 @@ impl TunListener {
         }
 
         let tun_net = cfg.inet4_address;
+        let conn_limit: Option<Arc<Semaphore>> = if max_conn > 0 {
+            Some(Arc::new(Semaphore::new(max_conn)))
+        } else {
+            None
+        };
+        let warned_saturated = Arc::new(AtomicBool::new(false));
+
         loop {
             tokio::select! {
                 accepted = tcp_listener.next() => match accepted {
@@ -604,8 +657,45 @@ impl TunListener {
                         }
                         let tunnel = self.tunnel.clone();
                         let name = self.name.clone();
+                        let sem = conn_limit.clone();
+                        let warned = Arc::clone(&warned_saturated);
                         tasks.spawn(async move {
-                            handle_tcp_flow(tunnel, stream, src, dst, &name).await;
+                            // lwIP only delivers this stream after the
+                            // handshake. We still wait for the first payload
+                            // before taking a max-connections slot / dialing.
+                            let mut stream = stream;
+                            let prefix = match wait_for_first_payload(&mut stream).await {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    debug!(
+                                        "tun TCP: dropping {src} -> {dst} before payload: {e}"
+                                    );
+                                    return;
+                                }
+                            };
+                            let permit = if let Some(sem) = sem {
+                                if sem.available_permits() == 0
+                                    && !warned.swap(true, Ordering::Relaxed)
+                                {
+                                    warn!(
+                                        "TUN listener '{name}' saturated at max-connections; \
+                                         payload-ready flows will wait"
+                                    );
+                                }
+                                match Arc::clone(&sem).acquire_owned().await {
+                                    Ok(p) => {
+                                        if sem.available_permits() > 0 {
+                                            warned.store(false, Ordering::Relaxed);
+                                        }
+                                        Some(p)
+                                    }
+                                    Err(_) => return,
+                                }
+                            } else {
+                                None
+                            };
+                            let _permit = permit;
+                            handle_tcp_flow(tunnel, stream, prefix, src, dst, &name).await;
                         });
                     }
                     None => return Err("netstack TCP listener closed".into()),
@@ -649,9 +739,34 @@ fn pump_error(direction: &str, joined: Result<io::Result<()>, tokio::task::JoinE
     }
 }
 
+/// Wait until the client sends at least one payload byte (handshake is
+/// already done by lwIP). Times out empty ESTABLISHED sockets.
+async fn wait_for_first_payload(tcp: &mut lwip::TcpStream) -> io::Result<Vec<u8>> {
+    wait_for_first_payload_timed(tcp, TUN_PAYLOAD_WAIT).await
+}
+
+async fn wait_for_first_payload_timed<R>(tcp: &mut R, wait: Duration) -> io::Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut buf = vec![0u8; TUN_FIRST_READ];
+    let n = timeout(wait, tcp.read(&mut buf))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "no payload after TCP handshake"))??;
+    if n == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "peer closed before sending payload",
+        ));
+    }
+    buf.truncate(n);
+    Ok(buf)
+}
+
 async fn handle_tcp_flow(
     tunnel: Tunnel,
-    tcp: TcpStream,
+    tcp: lwip::TcpStream,
+    prefix: Vec<u8>,
     src: SocketAddr, // client behind the tun
     dst: SocketAddr, // original destination
     in_name: &str,
@@ -668,47 +783,97 @@ async fn handle_tcp_flow(
     };
 
     // handle_tcp does the rest: fake-IP rewrite, lazy rule match, stats
-    // guard, dial, zero-alloc relay.
-    meow_tunnel::tcp::handle_tcp(tunnel.inner(), Box::new(TunTcpConn(tcp)), metadata).await;
+    // guard, dial, zero-alloc relay. `prefix` is the first payload already
+    // read while waiting for real traffic.
+    meow_tunnel::tcp::handle_tcp(
+        tunnel.inner(),
+        Box::new(TunTcpConn {
+            prefix,
+            pos: 0,
+            inner: std::sync::Mutex::new(tcp),
+        }),
+        metadata,
+    )
+    .await;
 }
 
-/// Newtype so the netstack TCP stream satisfies `ProxyConn` (a foreign
-/// type cannot implement the foreign `meow_common::ProxyConn` here).
-struct TunTcpConn(TcpStream);
+/// Netstack TCP stream plus the bytes already consumed while waiting for
+/// the first payload. The inner stream sits in a `Mutex` so the type is
+/// `Sync` (`ProxyConn` requires it); lwIP's `TcpStream` is `Send` but not
+/// `Sync`. Only one task ever polls a given connection.
+struct TunTcpConn<S> {
+    prefix: Vec<u8>,
+    pos: usize,
+    inner: std::sync::Mutex<S>,
+}
 
-impl AsyncRead for TunTcpConn {
+impl<S: AsyncRead + Unpin> AsyncRead for TunTcpConn<S> {
     fn poll_read(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.0).poll_read(cx, buf)
+        let this = self.get_mut();
+        if this.pos < this.prefix.len() {
+            let rest = &this.prefix[this.pos..];
+            let n = rest.len().min(buf.remaining());
+            buf.put_slice(&rest[..n]);
+            this.pos += n;
+            if this.pos == this.prefix.len() {
+                this.prefix.clear();
+                this.pos = 0;
+            }
+            return Poll::Ready(Ok(()));
+        }
+        let mut inner = this
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Pin::new(&mut *inner).poll_read(cx, buf)
     }
 }
 
-impl AsyncWrite for TunTcpConn {
+impl<S: AsyncWrite + Unpin> AsyncWrite for TunTcpConn<S> {
     fn poll_write(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.0).poll_write(cx, buf)
+        let this = self.get_mut();
+        let mut inner = this
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Pin::new(&mut *inner).poll_write(cx, buf)
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.0).poll_flush(cx)
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let mut inner = this
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Pin::new(&mut *inner).poll_flush(cx)
     }
 
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.0).poll_shutdown(cx)
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let mut inner = this
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Pin::new(&mut *inner).poll_shutdown(cx)
     }
 }
 
-impl ProxyConn for TunTcpConn {}
+impl<S: AsyncRead + AsyncWrite + Send + Sync + Unpin> ProxyConn for TunTcpConn<S> {}
 
 #[cfg(test)]
 mod tests {
-    use super::device_name_for_attempt;
+    use super::{device_name_for_attempt, wait_for_first_payload_timed, TunTcpConn};
+    use std::io;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[cfg(target_os = "macos")]
     #[test]
@@ -741,5 +906,70 @@ mod tests {
             device_name_for_attempt(Some("mytun"), 1),
             Some("mytun-1".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn wait_for_payload_returns_first_bytes() {
+        let (mut client, mut server) = tokio::io::duplex(64);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            server.write_all(b"GET /").await.unwrap();
+        });
+        let got = wait_for_first_payload_timed(&mut client, Duration::from_secs(1))
+            .await
+            .expect("payload");
+        assert_eq!(got, b"GET /");
+    }
+
+    #[tokio::test]
+    async fn wait_for_payload_times_out_without_data() {
+        let (mut client, _server) = tokio::io::duplex(64);
+        let err = wait_for_first_payload_timed(&mut client, Duration::from_millis(20))
+            .await
+            .expect_err("syn-only");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn wait_for_payload_eof_before_data_is_an_error() {
+        let (mut client, server) = tokio::io::duplex(64);
+        drop(server);
+        let err = wait_for_first_payload_timed(&mut client, Duration::from_secs(1))
+            .await
+            .expect_err("eof");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[tokio::test]
+    async fn prefix_is_replayed_then_inner_bytes() {
+        let (client, mut server) = tokio::io::duplex(64);
+        server.write_all(b"world").await.unwrap();
+        let mut conn = TunTcpConn {
+            prefix: b"hello".to_vec(),
+            pos: 0,
+            inner: std::sync::Mutex::new(client),
+        };
+        let mut buf = vec![0u8; 16];
+        let n = conn.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"hello");
+        let n = conn.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"world");
+    }
+
+    #[tokio::test]
+    async fn prefix_read_can_be_split_across_calls() {
+        let (client, _server) = tokio::io::duplex(64);
+        let mut conn = TunTcpConn {
+            prefix: b"abcdef".to_vec(),
+            pos: 0,
+            inner: std::sync::Mutex::new(client),
+        };
+        let mut buf = [0u8; 2];
+        assert_eq!(conn.read(&mut buf).await.unwrap(), 2);
+        assert_eq!(&buf, b"ab");
+        assert_eq!(conn.read(&mut buf).await.unwrap(), 2);
+        assert_eq!(&buf, b"cd");
+        assert_eq!(conn.read(&mut buf).await.unwrap(), 2);
+        assert_eq!(&buf, b"ef");
     }
 }

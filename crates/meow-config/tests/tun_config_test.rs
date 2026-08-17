@@ -42,6 +42,10 @@ async fn t1_no_tun_block_yields_default_disabled() {
     assert_eq!(cfg.tun.inet4_address.to_string(), "172.19.0.1/30");
     assert!(cfg.tun.auto_route, "auto-route defaults on");
     assert!(!cfg.tun.dns_hijack, "dns-hijack defaults off");
+    assert_eq!(
+        cfg.tun.max_connections, 256,
+        "TUN inherits the global max-connections default"
+    );
 }
 
 // ─── T2: minimal enable ───────────────────────────────────────────────────
@@ -255,4 +259,28 @@ async fn t14_outbound_interface_lands_and_empty_is_none() {
     let yaml = "tun:\n  enable: true\n  outbound-interface: ''\n";
     let cfg = load_config_from_str(yaml).await.expect("config must load");
     assert_eq!(cfg.tun.outbound_interface, None);
+}
+
+// ─── T15: global max-connections applies to TUN ───────────────────────────
+
+#[tokio::test]
+async fn t15_global_max_connections_applies_to_tun() {
+    let yaml = r#"
+max-connections: 32
+tun:
+  enable: true
+"#;
+    let cfg = load_config_from_str(yaml).await.expect("config must load");
+    assert_eq!(cfg.tun.max_connections, 32);
+}
+
+#[tokio::test]
+async fn t15b_max_connections_zero_is_unlimited() {
+    let yaml = r#"
+max-connections: 0
+tun:
+  enable: true
+"#;
+    let cfg = load_config_from_str(yaml).await.expect("config must load");
+    assert_eq!(cfg.tun.max_connections, 0);
 }

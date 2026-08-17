@@ -51,6 +51,7 @@ pub fn tun_config_to_listener_config(
         outbound_interface: tun.outbound_interface.clone(),
         dns_hijack: tun.dns_hijack,
         udp_timeout: tun.udp_timeout,
+        max_connections: tun.max_connections,
     }
 }
 

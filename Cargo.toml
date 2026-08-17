@@ -118,10 +118,11 @@ ipnet = "2"
 iprange = "0.6"
 
 # TUN inbound (issue #326) — cross-platform L3 device + userspace TCP/IP
-# stack + route table control. All three are optional, pulled in only by
-# meow-listener's `listener-tun` feature.
+# stack + route table control. Optional; pulled in only by meow-listener's
+# `listener-tun` feature. The stack is madeye/lwip (lwIP), not smoltcp:
+# accept is post-handshake, PCB/window/memory caps live in lwipopts.h.
 tun-rs = { version = "2.8", features = ["async_tokio"] }
-netstack-smoltcp = "0.2"
+lwip = { git = "https://github.com/madeye/lwip.git", rev = "5f6f0dfe025c967157ff328d94efe488852d8755" }
 route_manager = "0.2"
 
 # Crypto

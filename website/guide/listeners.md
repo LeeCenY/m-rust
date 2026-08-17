@@ -82,7 +82,9 @@ own OS-assigned port.
 - **`mixed`** — HTTP and SOCKS5 on one port; supports inbound auth and the sniffer.
 - **`http`** — HTTP CONNECT proxy.
 - **`socks5`** — SOCKS5 proxy; supports inbound auth.
-- **`tproxy`** — transparent proxy; see [Transparent Proxy](./transparent-proxy).
+- **`tproxy`** — firewall transparent proxy (Linux / experimental macOS); see [Transparent Proxy](./transparent-proxy).
+- **`tun:`** (top-level, not in this array) — L3 TUN inbound. On Windows this is a
+  Wintun adapter and is the transparent-proxy path. See [Transparent Proxy](./transparent-proxy).
 
 ## Inbound authentication
 

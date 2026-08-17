@@ -76,16 +76,18 @@ Logic composition rules (AND, OR, NOT) are also supported for combining conditio
 - **HTTP Proxy** -- HTTP CONNECT and plain HTTP forwarding
 - **SOCKS5** -- SOCKS5 with optional authentication
 - **Transparent Proxy (TProxy)** -- Kernel-level traffic interception via nftables (Linux) or pf (macOS)
+- **TUN / Wintun** -- L3 inbound (`tun:`). On Windows this is a [Wintun](https://www.wintun.net/) adapter and is the transparent-proxy path; official Windows zips ship `wintun.dll` beside `meow.exe`, and the binary also embeds a copy to extract if the sidecar is missing
 
 ### Transparent Proxy
-Intercept all local TCP traffic at the kernel firewall level without per-app proxy configuration.
+Intercept local traffic without per-app proxy configuration.
 
-- **nftables** redirect on Linux, **pf** anchor on macOS
-- **Loop avoidance**: SO_MARK on outbound DIRECT sockets (Linux), UID-based bypass (macOS), plus IP bypass for upstream proxy servers
+- **Windows**: Wintun TUN adapter (`tun:`). Requires an elevated process and `wintun.dll` next to `meow.exe` (included in official zips). Fake-IP DNS capture; see [docs/tun.md](docs/tun.md).
+- **Linux / macOS**: nftables redirect (Linux) or pf anchor (macOS) via `tproxy-port`
+- **Loop avoidance (tproxy)**: SO_MARK on outbound DIRECT sockets (Linux), UID-based bypass (macOS), plus IP bypass for upstream proxy servers
 - **SNI extraction**: Peek at TLS ClientHello to recover hostname for HTTPS traffic
 - **DNS snooping**: Reverse IP→domain lookup from recent DNS queries for non-TLS traffic
-- **RAII firewall guard**: Rules automatically cleaned up on shutdown (SIGINT/SIGTERM)
-- Configurable via `tproxy-port`, `routing-mark`, and `tproxy-sni` in YAML
+- **RAII firewall guard**: tproxy rules automatically cleaned up on shutdown (SIGINT/SIGTERM)
+- Configurable via `tun:`, `tproxy-port`, `routing-mark`, and `tproxy-sni` in YAML
 
 The built-in firewall transparently proxies the **host's own** traffic. To build a **LAN gateway** that forwards and proxies *other* devices' traffic, see [docs/tproxy-gateway.md](docs/tproxy-gateway.md).
 
