@@ -191,3 +191,68 @@ tun:
     assert!(!cfg.tun.enable);
     assert_eq!(cfg.tun.device.as_deref(), Some("meow0"));
 }
+
+// ─── T11–T14: auto-route modes (#375) ─────────────────────────────────────
+
+#[tokio::test]
+async fn t11_auto_route_bool_compat_maps_to_fake_ip() {
+    use meow_config::TunRouteMode;
+
+    // mihomo's boolean forms keep working: true = fake-IP scope, false = off.
+    let on = load_config_from_str("tun:\n  enable: true\n  auto-route: true\n")
+        .await
+        .expect("config must load");
+    assert!(on.tun.auto_route);
+    assert_eq!(on.tun.route_mode, TunRouteMode::FakeIp);
+
+    let off = load_config_from_str("tun:\n  enable: true\n  auto-route: false\n")
+        .await
+        .expect("config must load");
+    assert!(!off.tun.auto_route);
+
+    // Absent → default on, fake-IP scope.
+    let default = load_config_from_str("tun:\n  enable: true\n")
+        .await
+        .expect("config must load");
+    assert!(default.tun.auto_route);
+    assert_eq!(default.tun.route_mode, TunRouteMode::FakeIp);
+}
+
+#[tokio::test]
+async fn t12_auto_route_mode_strings() {
+    use meow_config::TunRouteMode;
+
+    let fake = load_config_from_str("tun:\n  enable: true\n  auto-route: fake-ip\n")
+        .await
+        .expect("config must load");
+    assert!(fake.tun.auto_route);
+    assert_eq!(fake.tun.route_mode, TunRouteMode::FakeIp);
+
+    let global = load_config_from_str("tun:\n  enable: true\n  auto-route: global\n")
+        .await
+        .expect("config must load");
+    assert!(global.tun.auto_route);
+    assert_eq!(global.tun.route_mode, TunRouteMode::Global);
+}
+
+#[tokio::test]
+async fn t13_auto_route_unknown_mode_is_a_hard_error() {
+    let err = expect_load_err("tun:\n  enable: true\n  auto-route: everything\n").await;
+    assert!(
+        err.contains("auto-route") && err.contains("everything"),
+        "error must name the field and the bad value: got {err}"
+    );
+}
+
+#[tokio::test]
+async fn t14_outbound_interface_lands_and_empty_is_none() {
+    let yaml = "tun:\n  enable: true\n  auto-route: global\n  outbound-interface: eth0\n";
+    let cfg = load_config_from_str(yaml).await.expect("config must load");
+    assert_eq!(cfg.tun.outbound_interface.as_deref(), Some("eth0"));
+
+    // Empty string is treated as unset (auto-detect), and setting the field
+    // in fake-ip mode is warn-only, not an error.
+    let yaml = "tun:\n  enable: true\n  outbound-interface: ''\n";
+    let cfg = load_config_from_str(yaml).await.expect("config must load");
+    assert_eq!(cfg.tun.outbound_interface, None);
+}
