@@ -23,15 +23,15 @@ use meow_common::{
 use smol_str::SmolStr;
 use tracing::debug;
 
+#[cfg(feature = "mux")]
+use crate::mux::{MuxClient, MuxOptions};
 use crate::stream_conn::StreamConn;
 use crate::transport_chain::TransportChain;
 use crate::vless::{addr_from_metadata, Cmd, VlessConn, VlessPacketConn};
+use std::sync::Arc;
 
 #[cfg(feature = "vless-vision")]
 use crate::vless::VisionConn;
-
-#[cfg(feature = "vless-encryption")]
-use std::sync::Arc;
 
 #[cfg(feature = "vless-encryption")]
 use crate::vless::encryption::ClientInstance;
@@ -57,7 +57,10 @@ pub struct VlessAdapter {
     uuid_bytes: [u8; 16],
     flow: Option<VlessFlow>,
     udp: bool,
-    transport: TransportChain,
+    transport: Arc<TransportChain>,
+    /// sing-mux compatible connection multiplexing (optional).
+    #[cfg(feature = "mux")]
+    mux: Option<Arc<MuxClient>>,
     /// VLESS post-quantum Encryption (`mlkem768x25519plus`), applied below the
     /// VLESS header exchange once per dial. `None` for plain VLESS.
     #[cfg(feature = "vless-encryption")]
@@ -88,11 +91,87 @@ impl VlessAdapter {
             uuid_bytes,
             flow,
             udp,
-            transport,
+            transport: Arc::new(transport),
+            #[cfg(feature = "mux")]
+            mux: None,
             #[cfg(feature = "vless-encryption")]
             encryption: None,
             health: ProxyHealth::new(),
         }
+    }
+
+    /// Enable connection multiplexing.  sing-mux (smux in this PR; yamux/h2mux
+    /// land in follow-up PRs) shares one connection pool: the session's VLESS
+    /// request targets the reserved mux destination
+    /// (sp.mux.sing-box.arpa:444) and a mux request header follows; the server
+    /// must be sing-box / mihomo with multiplex enabled.
+    #[cfg(feature = "mux")]
+    pub fn with_mux(mut self, options: MuxOptions) -> Self {
+        use crate::mux::{MuxClient, MUX_DESTINATION_FQDN, MUX_DESTINATION_PORT};
+        use crate::vless::header::VlessAddr;
+        use std::sync::Arc as StdArc;
+
+        let server = self.server.clone();
+        let port = self.port;
+        let uuid_bytes = self.uuid_bytes;
+        let transport = StdArc::clone(&self.transport);
+        let flow = self.flow;
+        #[cfg(feature = "vless-encryption")]
+        let encryption = self.encryption.clone();
+
+        let dial: crate::mux::DialFn = StdArc::new(move || {
+            let server = server.clone();
+            let transport = StdArc::clone(&transport);
+            #[cfg(feature = "vless-encryption")]
+            let encryption = encryption.clone();
+            Box::pin(async move {
+                let tcp = meow_common::connect_tcp_host(&server, port)
+                    .await
+                    .map_err(MeowError::Io)?;
+                let stream = transport.connect(Box::new(tcp)).await?;
+                #[cfg(feature = "vless-encryption")]
+                let stream = match &encryption {
+                    Some(encryption) => encryption.handshake(stream).await?,
+                    None => stream,
+                };
+                let flow_str = match flow {
+                    #[cfg(feature = "vless-vision")]
+                    Some(VlessFlow::XtlsRprxVision) => Some("xtls-rprx-vision"),
+                    _ => None,
+                };
+                let addr = VlessAddr::domain(MUX_DESTINATION_FQDN).expect("static mux fqdn");
+                #[cfg(feature = "vless-vision")]
+                // Defense-in-depth: parse_vless rejects vision+mux at config
+                // time; this guards programmatic construction.  Match on
+                // flow_str (which is Some only for the Vision variant) rather
+                // than flow.is_some(), so a future second flow variant does
+                // not silently build a VisionConn.
+                if flow_str.is_some() {
+                    let vless = VlessConn::new_deferred(
+                        stream,
+                        &uuid_bytes,
+                        flow_str,
+                        Cmd::Tcp,
+                        MUX_DESTINATION_PORT,
+                        &addr,
+                    )
+                    .await?;
+                    return Ok(Box::new(VisionConn::new(vless, uuid_bytes)) as Box<dyn ProxyConn>);
+                }
+                let conn = VlessConn::new(
+                    stream,
+                    &uuid_bytes,
+                    flow_str,
+                    Cmd::Tcp,
+                    MUX_DESTINATION_PORT,
+                    &addr,
+                )
+                .await?;
+                Ok(Box::new(StreamConn(Box::new(conn))) as Box<dyn ProxyConn>)
+            })
+        });
+        self.mux = Some(MuxClient::new(dial, options));
+        self
     }
 
     /// Attach a VLESS Encryption client (`encryption: mlkem768x25519plus…`).
@@ -135,7 +214,19 @@ impl ProxyAdapter for VlessAdapter {
     }
 
     fn support_udp(&self) -> bool {
-        self.udp
+        // With mux enabled, UDP rides the mux TCP session (unless
+        // `only-tcp` forces the plain path) — mirrors mihomo's
+        // SingMux.SupportUDP.
+        self.udp || {
+            #[cfg(feature = "mux")]
+            {
+                self.mux.as_ref().is_some_and(|mux| mux.supports_udp())
+            }
+            #[cfg(not(feature = "mux"))]
+            {
+                false
+            }
+        }
     }
 
     async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
@@ -145,6 +236,12 @@ impl ProxyAdapter for VlessAdapter {
             self.addr_str,
             self.flow
         );
+
+        #[cfg(feature = "mux")]
+        if let Some(mux) = &self.mux {
+            let conn = mux.open_stream_for(metadata, "vless").await?;
+            return Ok(Box::new(conn));
+        }
 
         let stream = self.dial_stream().await?;
         let addr = addr_from_metadata(metadata);
@@ -164,11 +261,12 @@ impl ProxyAdapter for VlessAdapter {
             }
         };
 
-        // Vision must wrap the connection BEFORE the request header is sent:
-        // xray expects the VLESS request inside the first Vision-padded record
-        // (mihomo wires it the same way), so the header is deferred to the
-        // first write through the Vision layer.
         let conn = match self.flow {
+            // Vision must wrap the connection BEFORE the request header is
+            // sent: xray expects the VLESS request inside the first
+            // Vision-padded record (mihomo wires it the same way), so the
+            // header is deferred to the first write through the Vision
+            // layer.
             #[cfg(feature = "vless-vision")]
             Some(VlessFlow::XtlsRprxVision) => {
                 let vless = VlessConn::new_deferred(
@@ -199,6 +297,20 @@ impl ProxyAdapter for VlessAdapter {
     }
 
     async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
+        #[cfg(feature = "mux")]
+        if let Some(mux) = &self.mux {
+            if mux.supports_udp() {
+                debug!(
+                    "VLESS mux UDP connecting to {} via {}",
+                    metadata.remote_address(),
+                    self.addr_str
+                );
+            }
+            if let Some(conn) = mux.open_packet_stream_for(metadata, "vless").await? {
+                return Ok(conn);
+            }
+        }
+
         // Vision is TCP-only; UDP always uses plain VlessConn regardless of flow.
         debug!(
             "VLESS UDP connecting to {} via {}",

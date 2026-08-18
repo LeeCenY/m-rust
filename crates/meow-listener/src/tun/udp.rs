@@ -230,8 +230,12 @@ async fn relay_flow(
     // reader loop), downstream packets, and the idle deadline. Reply
     // source addresses are not rewritten: the tun flow is locked to one
     // (src, dst) tuple, so every reply is delivered as coming from `dst`.
-    // A downstream read cancelled by another branch may drop one datagram
-    // — acceptable under UDP delivery semantics.
+    // A downstream read cancelled by another branch may drop the current
+    // datagram: the property holds for VlessUdpReader / MuxPacketConn
+    // (which persist progress), but `relay_flow` is generic over
+    // `Box<dyn ProxyPacketConn>` and Direct / Shadowsocks / Trojan UDP
+    // conns do not carry that invariant.  This is acceptable under UDP
+    // delivery semantics.
     let mut buf = vec![0u8; DATAGRAM_BUF];
     let idle = sleep(udp_timeout);
     tokio::pin!(idle);

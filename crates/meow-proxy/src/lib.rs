@@ -2,6 +2,8 @@ pub mod direct;
 pub mod group;
 pub mod health;
 pub mod http_adapter;
+#[cfg(feature = "mux")]
+pub mod mux;
 pub mod reject;
 pub mod socks5_adapter;
 pub mod stream_conn;
