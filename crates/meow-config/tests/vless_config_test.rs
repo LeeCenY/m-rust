@@ -692,7 +692,7 @@ proxies:
 /// D16: `parse_vless_mux_enabled_loads_with_sing_mux`
 ///
 /// `smux: { enabled: true }` → parse succeeds and the adapter is wired for
-/// sing-mux multiplexing (default protocol smux in this PR; h2mux lands later).  No mux
+/// sing-mux multiplexing (default protocol h2mux, matching mihomo).  No mux
 /// warn is emitted — the feature is implemented.
 /// Interop note: server must be sing-box / mihomo based (Xray-only servers
 /// speak Mux.Cool, not this protocol).
@@ -1121,5 +1121,32 @@ proxies:
     assert_eq!(
         mux_warns, 0,
         "yamux is implemented: no warn expected; captured lines: {lines:?}"
+    );
+}
+
+/// D16b: explicit `protocol: h2mux` → accepted without warn.
+#[cfg(feature = "mux")]
+#[tokio::test]
+async fn parse_vless_mux_h2mux_accepted() {
+    let yaml = r#"
+proxies:
+  - name: v
+    type: vless
+    server: example.com
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    mux:
+      enabled: true
+      protocol: h2mux
+"#;
+    let (result, lines) = with_warn_capture_async(load_config_from_str(yaml)).await;
+    result.expect("h2mux mux must load");
+    let mux_warns = lines
+        .iter()
+        .filter(|l| l.contains("WARN") && l.to_lowercase().contains("mux"))
+        .count();
+    assert_eq!(
+        mux_warns, 0,
+        "h2mux is implemented: no warn expected; captured lines: {lines:?}"
     );
 }

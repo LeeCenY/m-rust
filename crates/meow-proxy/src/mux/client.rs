@@ -5,6 +5,7 @@
 //! on the session with the fewest streams, new sessions are dialed only when
 //! the configured connection/stream bounds are reached.
 
+use super::h2mux;
 use super::packet::MuxPacketConn;
 use super::request::Request;
 use super::smux;
@@ -51,10 +52,9 @@ pub struct MuxOptions {
 
 impl Default for MuxOptions {
     fn default() -> Self {
-        // smux is the default protocol in this PR; h2mux (mihomo's default)
-        // lands in a follow-up PR.
+        // h2mux is mihomo's default protocol (empty `protocol` maps to it).
         Self {
-            protocol: Protocol::Smux,
+            protocol: Protocol::H2Mux,
             padding: false,
             max_connections: 4,
             min_streams: 4,
@@ -75,6 +75,7 @@ fn now_ms() -> u64 {
 pub(crate) enum SessionKind {
     Smux(Arc<smux::Session>),
     Yamux(Arc<yamux::Session>),
+    H2Mux(Arc<h2mux::Session>),
 }
 
 /// Write the sing-mux per-stream request prefix (flags + Socksaddr
@@ -119,6 +120,12 @@ impl SessionKind {
                 write_request_prefix(&mut stream, host, port, udp).await?;
                 Ok(stream)
             }
+            SessionKind::H2Mux(session) => {
+                let mut stream =
+                    MuxStream::new(session.open_stream().await.map(MuxStreamKind::H2Mux)?);
+                write_request_prefix(&mut stream, host, port, udp).await?;
+                Ok(stream)
+            }
         }
     }
 
@@ -126,6 +133,7 @@ impl SessionKind {
         match self {
             SessionKind::Smux(session) => session.is_dead(),
             SessionKind::Yamux(session) => session.is_dead(),
+            SessionKind::H2Mux(session) => session.is_dead(),
         }
     }
 }
@@ -148,6 +156,7 @@ pub(crate) struct MuxStream {
 pub(crate) enum MuxStreamKind {
     Smux(smux::SmuxStream),
     Yamux(yamux::Stream),
+    H2Mux(h2mux::Stream),
 }
 
 impl MuxStreamKind {
@@ -167,6 +176,7 @@ impl AsyncRead for MuxStreamKind {
         match self.get_mut() {
             MuxStreamKind::Smux(stream) => Pin::new(stream).poll_read(cx, buf),
             MuxStreamKind::Yamux(stream) => Pin::new(stream).poll_read(cx, buf),
+            MuxStreamKind::H2Mux(stream) => Pin::new(stream).poll_read(cx, buf),
         }
     }
 }
@@ -241,6 +251,7 @@ impl AsyncWrite for MuxStream {
         match &mut self.get_mut().kind {
             MuxStreamKind::Smux(stream) => Pin::new(stream).poll_write(cx, buf),
             MuxStreamKind::Yamux(stream) => Pin::new(stream).poll_write(cx, buf),
+            MuxStreamKind::H2Mux(stream) => Pin::new(stream).poll_write(cx, buf),
         }
     }
 
@@ -248,6 +259,7 @@ impl AsyncWrite for MuxStream {
         match &mut self.get_mut().kind {
             MuxStreamKind::Smux(stream) => Pin::new(stream).poll_flush(cx),
             MuxStreamKind::Yamux(stream) => Pin::new(stream).poll_flush(cx),
+            MuxStreamKind::H2Mux(stream) => Pin::new(stream).poll_flush(cx),
         }
     }
 
@@ -255,6 +267,7 @@ impl AsyncWrite for MuxStream {
         match &mut self.get_mut().kind {
             MuxStreamKind::Smux(stream) => Pin::new(stream).poll_shutdown(cx),
             MuxStreamKind::Yamux(stream) => Pin::new(stream).poll_shutdown(cx),
+            MuxStreamKind::H2Mux(stream) => Pin::new(stream).poll_shutdown(cx),
         }
     }
 }
@@ -528,6 +541,9 @@ impl MuxClient {
             )),
             Protocol::Yamux => SessionKind::Yamux(Arc::new(
                 yamux::Session::client(conn).map_err(MeowError::Io)?,
+            )),
+            Protocol::H2Mux => SessionKind::H2Mux(Arc::new(
+                h2mux::Session::client(conn).await.map_err(MeowError::Io)?,
             )),
         })
     }

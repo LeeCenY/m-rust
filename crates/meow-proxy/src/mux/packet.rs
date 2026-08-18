@@ -622,7 +622,7 @@ mod tests {
         let client = MuxClient::new(
             dial,
             MuxOptions {
-                protocol: Protocol::Smux,
+                protocol: Protocol::H2Mux,
                 ..MuxOptions::default()
             },
         );

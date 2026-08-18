@@ -1481,10 +1481,9 @@ fn parse_mux_options(
     if !enabled {
         return Ok(None);
     }
-    // Empty protocol maps to smux in this PR; h2mux (mihomo's default) lands
-    // in a follow-up PR.
+    // Empty protocol maps to h2mux, matching mihomo's default.
     let protocol_str = match mux_cfg.get("protocol") {
-        None => "smux",
+        None => "h2mux",
         Some(serde_yaml::Value::String(s)) => s.as_str(),
         Some(other) => {
             return Err(format!(
@@ -1496,7 +1495,7 @@ fn parse_mux_options(
         // mihomo hard-errors on unknown protocols; do the same so a typo
         // cannot silently speak the wrong wire protocol to the server.
         return Err(format!(
-            "{name}: unknown mux protocol '{protocol_str}'; valid value: smux (yamux/h2mux/muxcool land in follow-up PRs)"
+            "{name}: unknown mux protocol '{protocol_str}'; valid values: smux, yamux, h2mux (muxcool lands in a follow-up PR)"
         ));
     };
     // max-connections=0 AND max-streams=0 means one physical connection
