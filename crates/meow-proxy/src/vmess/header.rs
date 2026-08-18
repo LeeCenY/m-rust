@@ -183,6 +183,16 @@ pub fn seal_request_header(
     seal_header(cmd_key, security, cmd)
 }
 
+/// Seal a VMess request header carrying CommandMux (0x03) and no
+/// destination — the Mux.Cool-over-VMess session signaling (server:
+/// sing-vmess service.go `case CommandMux: return HandleMuxConnection`).
+pub fn seal_mux_request_header(
+    cmd_key: &[u8; 16],
+    security: Security,
+) -> Result<SealedHeader, String> {
+    seal_header(cmd_key, security, HeaderCmd::Mux)
+}
+
 /// Response body key/iv for AEAD VMess, derived from the request body
 /// key/iv: `respBodyKey = SHA256(req_key)[..16]`, `respBodyIV = SHA256(req_iv)[..16]`.
 ///
@@ -265,12 +275,19 @@ fn build_auth_id(cmd_key: &[u8; 16], rng: &mut impl RngCore) -> [u8; 16] {
     block
 }
 
+/// Request command byte (xray `RequestCommand*`).  Mux.Cool-over-VMess
+/// signals the session with CommandMux (0x03) and no destination — the
+/// server (sing-vmess `service.go`, present since 2022) routes it straight
+/// into `HandleMuxConnection`.
+const CMD_MUX: u8 = 0x03;
+
 /// The header destination: `None` for CommandMux (no port/address follows
 /// the command byte — mirrors sing-vmess `if command != CommandMux`).
 #[derive(Clone, Copy)]
 enum HeaderCmd<'a> {
     Tcp(&'a Metadata),
     Udp(&'a Metadata),
+    Mux,
 }
 
 fn build_header_plaintext(
@@ -285,6 +302,7 @@ fn build_header_plaintext(
     let (cmd_byte, metadata) = match cmd {
         HeaderCmd::Tcp(m) => (CMD_TCP, Some(m)),
         HeaderCmd::Udp(m) => (CMD_UDP, Some(m)),
+        HeaderCmd::Mux => (CMD_MUX, None),
     };
 
     let mut buf = Vec::with_capacity(64);

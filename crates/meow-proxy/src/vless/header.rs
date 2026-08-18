@@ -85,6 +85,10 @@ pub(crate) fn addr_from_metadata(m: &Metadata) -> VlessAddr {
 pub(crate) enum Cmd {
     Tcp = 0x01,
     Udp = 0x02,
+    /// `0x03` — Mux.Cool session (Xray `CommandMux`): the request carries
+    /// no port/address; per-stream targets ride mux frames on the stream.
+    #[cfg(feature = "mux")]
+    Mux = 0x03,
 }
 
 // ─── Request encoder ──────────────────────────────────────────────────────────
@@ -151,6 +155,22 @@ fn put_flow_addon(dst: &mut BytesMut, flow: Option<&str>) {
             dst.put_u8(0x00); // addon_length = 0
         }
     }
+}
+
+/// Encode a VLESS Mux.Cool session request: `version + uuid + addons +
+/// command 0x03` — **no port/address**.
+///
+/// upstream: xray proxy/vless/encoding/encoding.go::EncodeRequestHeader —
+/// for `RequestCommandMux` the command byte is written and port/address
+/// are omitted (the `if command != ...Mux` guard); sing-vmess
+/// vless/protocol.go::ReadRequest mirrors it by skipping the address parse
+/// for `CommandMux`.
+#[cfg(feature = "mux")]
+pub(crate) fn encode_mux_request(dst: &mut BytesMut, uuid_bytes: &[u8; 16], flow: Option<&str>) {
+    dst.put_u8(0x00); // version
+    dst.put_slice(uuid_bytes);
+    put_flow_addon(dst, flow);
+    dst.put_u8(Cmd::Mux as u8); // command — signals the Mux.Cool session
 }
 
 // The VLESS response header `[version][addon_length][addon…]` is consumed
