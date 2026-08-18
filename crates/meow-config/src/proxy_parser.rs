@@ -129,7 +129,8 @@ pub fn parse_proxy(
             let plugin = config.get("plugin").and_then(|v| v.as_str());
             let plugin_opts_str = config.get("plugin-opts").and_then(serialize_plugin_opts);
 
-            let adapter = ShadowsocksAdapter::new(
+            #[cfg_attr(not(feature = "mux"), allow(unused_mut))]
+            let mut adapter = ShadowsocksAdapter::new(
                 name,
                 server,
                 port,
@@ -140,7 +141,12 @@ pub fn parse_proxy(
                 plugin_opts_str.as_deref(),
             )
             .map_err(|e| format!("ss: {e}"))?;
-            // SS mux wiring lands in a follow-up PR (sing-mux for Shadowsocks).
+            #[cfg(feature = "mux")]
+            if let Some(mux_options) = parse_mux_options(name, config)? {
+                adapter = adapter.with_mux(mux_options);
+            }
+            #[cfg(not(feature = "mux"))]
+            parse_mux_options(name, config)?;
             Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
         }
         #[cfg(feature = "trojan")]
@@ -1980,9 +1986,15 @@ fn parse_vmess(
         }
     }
 
-    let adapter =
+    #[cfg_attr(not(feature = "mux"), allow(unused_mut))]
+    let mut adapter =
         meow_proxy::VmessAdapter::new(name, server, port, uuid_bytes, security, udp, chain);
-    // VMess mux wiring lands in a follow-up PR (sing-mux + Mux.Cool for VMess).
+    #[cfg(feature = "mux")]
+    if let Some(mux_options) = parse_mux_options(name, config)? {
+        adapter = adapter.with_mux(mux_options);
+    }
+    #[cfg(not(feature = "mux"))]
+    parse_mux_options(name, config)?;
 
     Ok(adapter)
 }
