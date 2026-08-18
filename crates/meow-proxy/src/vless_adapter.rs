@@ -164,21 +164,38 @@ impl ProxyAdapter for VlessAdapter {
             }
         };
 
-        let conn = VlessConn::new(
-            stream,
-            &self.uuid_bytes,
-            flow_str,
-            Cmd::Tcp,
-            metadata.dst_port,
-            &addr,
-        )
-        .await?;
-
-        match self.flow {
+        // Vision must wrap the connection BEFORE the request header is sent:
+        // xray expects the VLESS request inside the first Vision-padded record
+        // (mihomo wires it the same way), so the header is deferred to the
+        // first write through the Vision layer.
+        let conn = match self.flow {
             #[cfg(feature = "vless-vision")]
-            Some(VlessFlow::XtlsRprxVision) => Ok(Box::new(VisionConn::new(conn, self.uuid_bytes))),
-            _ => Ok(Box::new(StreamConn(Box::new(conn)))),
-        }
+            Some(VlessFlow::XtlsRprxVision) => {
+                let vless = VlessConn::new_deferred(
+                    stream,
+                    &self.uuid_bytes,
+                    flow_str,
+                    Cmd::Tcp,
+                    metadata.dst_port,
+                    &addr,
+                )
+                .await?;
+                Box::new(VisionConn::new(vless, self.uuid_bytes)) as Box<dyn ProxyConn>
+            }
+            _ => {
+                let conn = VlessConn::new(
+                    stream,
+                    &self.uuid_bytes,
+                    flow_str,
+                    Cmd::Tcp,
+                    metadata.dst_port,
+                    &addr,
+                )
+                .await?;
+                Box::new(StreamConn(Box::new(conn)))
+            }
+        };
+        Ok(conn)
     }
 
     async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {

@@ -430,10 +430,19 @@ impl AsyncWrite for RealityTlsStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        if let Poll::Ready(done) = self.drain_pending_write(cx) {
-            done?;
-        } else {
-            return Poll::Pending;
+        // Drain any in-flight record first.  If the drain is still
+        // Pending, nothing from the incoming `buf` has been consumed —
+        // return Pending so the caller retries with the same buffer.
+        // If the drain completes, fall through to seal the new buffer
+        // rather than reporting the *old* record's length against the
+        // new buffer (AsyncWrite does not guarantee the same buffer is
+        // presented after a Pending).
+        if self.write_pending.is_some() {
+            match self.drain_pending_write(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Ready(Ok(())) => {} // drained — fall through
+            }
         }
 
         if buf.is_empty() {
@@ -444,14 +453,23 @@ impl AsyncWrite for RealityTlsStream {
             return Pin::new(&mut self.inner).poll_write(cx, buf);
         }
 
+        // TLS records carry a u16 length: chunk large writes into
+        // standard 16 KiB records instead of letting the length field
+        // wrap (which would desynchronise the peer's TLS reader).
+        let chunk_len = buf.len().min(16 * 1024);
         let frame = self
             .write_key
-            .seal(TLS_RECORD_APPLICATION_DATA, buf)
+            .seal(TLS_RECORD_APPLICATION_DATA, &buf[..chunk_len])
             .map_err(transport_io_error)?;
         self.write_pending = Some(StreamPendingWrite { frame, pos: 0 });
+        // The record is buffered; report chunk_len immediately whether
+        // or not the drain completes now.  The next poll_write /
+        // poll_flush / poll_shutdown drains it.  Returning Pending here
+        // would be unsafe: the sealed record's plaintext length would
+        // be reported against whatever buffer arrives on the next poll.
         match self.drain_pending_write(cx) {
-            Poll::Ready(Ok(())) | Poll::Pending => Poll::Ready(Ok(buf.len())),
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            _ => Poll::Ready(Ok(chunk_len)),
         }
     }
 
@@ -553,9 +571,17 @@ fn build_reality_client_hello(
         .duration_since(UNIX_EPOCH)
         .map_err(|e| TransportError::Tls(format!("system clock before UNIX_EPOCH: {e}")))?
         .as_secs() as u32;
+    // Auth payload layout must match the server's expectation.  The first
+    // three bytes are the REALITY ClientVer triple.  sing-box hardcodes
+    // [1, 8, 1] (common/tls/reality_client.go:186-188); xray-core uses its
+    // own version bytes (transport/internet/reality/reality.go:143-145).
+    // Neither server validates these bytes — they are part of the 16-byte
+    // AES-GCM auth payload, and the server only checks the short_id and
+    // timestamp after decryption.  Using sing-box's value is the safe
+    // interop choice: it works with both sing-box and xray servers.
     reality_plain[0] = 1;
     reality_plain[1] = 8;
-    reality_plain[2] = 2;
+    reality_plain[2] = 1;
     reality_plain[3] = 0;
     reality_plain[4..8].copy_from_slice(&unix.to_be_bytes());
     reality_plain[8..16].copy_from_slice(&reality.short_id);
@@ -1063,6 +1089,11 @@ impl RecordKey {
         body.push(inner_type);
 
         let record_len = body.len() + 16;
+        if record_len > u16::MAX as usize {
+            return Err(TransportError::Tls(format!(
+                "TLS record exceeds u16 length: {record_len}"
+            )));
+        }
         let mut header = Vec::with_capacity(5);
         header.push(TLS_RECORD_APPLICATION_DATA);
         header.extend_from_slice(&[0x03, 0x03]);
@@ -1435,11 +1466,145 @@ mod tests {
         assert!(extract_ed25519_spki(&spki[2..]).is_none());
     }
 
+    // ─── Split + concurrent direction polling (mux regression) ───────────────
+
+    /// Deterministic chunk bytes for a (seq, len) pair.
+    fn chunk(seq: u32, len: usize) -> Vec<u8> {
+        let mut state = seq.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let mut out = Vec::with_capacity(len);
+        for _ in 0..len {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            out.push((state >> 24) as u8);
+        }
+        out
+    }
+
+    /// Invariant test backing the mux corruption investigation: the REALITY
+    /// record layer, driven through tokio split (read and write halves
+    /// polled from two tasks concurrently), must preserve data byte-exact.
+    /// The stress-era corruption was traced to the mux layer's stored-future
+    /// write (a Pending re-poll re-framed the same chunk, duplicating it),
+    /// NOT to this layer — this test locks that conclusion in: if split
+    /// driving ever corrupts here, the layer needs its own fix.
+    /// (see proxy-mux.md §6)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn split_concurrent_read_write_preserves_data() {
+        let (client_io, server_io) = tokio::io::duplex(512 * 1024);
+        let secret = [0x5Au8; 32];
+
+        let client_stream = RealityTlsStream {
+            inner: Box::new(client_io),
+            read_key: RecordKey::new(CipherSuite::Aes128GcmSha256, &secret),
+            write_key: RecordKey::new(CipherSuite::Aes128GcmSha256, &secret),
+            read_raw_passthrough: false,
+            write_raw_passthrough: false,
+            read_plain: VecDeque::new(),
+            read_state: StreamReadState::Header {
+                buf: [0; 5],
+                pos: 0,
+            },
+            write_pending: None,
+        };
+        let server_stream = RealityTlsStream {
+            inner: Box::new(server_io),
+            read_key: RecordKey::new(CipherSuite::Aes128GcmSha256, &secret),
+            write_key: RecordKey::new(CipherSuite::Aes128GcmSha256, &secret),
+            read_raw_passthrough: false,
+            write_raw_passthrough: false,
+            read_plain: VecDeque::new(),
+            read_state: StreamReadState::Header {
+                buf: [0; 5],
+                pos: 0,
+            },
+            write_pending: None,
+        };
+
+        // Server: read [u32 LE len][data] plaintext frames, echo them back.
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut s = server_stream;
+            loop {
+                let mut len_b = [0u8; 4];
+                if s.read_exact(&mut len_b).await.is_err() {
+                    return;
+                }
+                let len = u32::from_le_bytes(len_b) as usize;
+                if len == 0 {
+                    return;
+                }
+                let mut data = vec![0u8; len];
+                if s.read_exact(&mut data).await.is_err() {
+                    return;
+                }
+                if s.write_all(&len_b).await.is_err()
+                    || s.write_all(&data).await.is_err()
+                    || s.flush().await.is_err()
+                {
+                    return;
+                }
+            }
+        });
+
+        let (rd, wr) = tokio::io::split(Box::new(client_stream) as Box<dyn Stream>);
+
+        // Reader task: verify every echoed chunk against the deterministic
+        // generator — any corruption shows up as a mismatch.
+        let reader = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut rd = rd;
+            let mut seq = 0u32;
+            let mut bad = 0u32;
+            let mut count = 0u32;
+            loop {
+                let mut len_b = [0u8; 4];
+                if rd.read_exact(&mut len_b).await.is_err() {
+                    return (count, bad);
+                }
+                let len = u32::from_le_bytes(len_b) as usize;
+                if len == 0 {
+                    return (count, bad);
+                }
+                let mut data = vec![0u8; len];
+                if rd.read_exact(&mut data).await.is_err() {
+                    return (count, bad);
+                }
+                if data != chunk(seq, len) {
+                    bad += 1;
+                }
+                count += 1;
+                seq += 1;
+            }
+        });
+
+        // Writer task: full-duplex pressure against the parked reader.
+        let write_task = tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let mut wr = wr;
+            for seq in 0..2000u32 {
+                let len = 1 + ((seq.wrapping_mul(2_654_435_761)) % 8192) as usize;
+                let data = chunk(seq, len);
+                let mut frame = Vec::with_capacity(4 + len);
+                frame.extend_from_slice(&(len as u32).to_le_bytes());
+                frame.extend_from_slice(&data);
+                if wr.write_all(&frame).await.is_err() || wr.flush().await.is_err() {
+                    return;
+                }
+            }
+            let _ = wr.write_all(&[0u8; 4]).await;
+            let _ = wr.flush().await;
+        });
+        write_task.await.unwrap();
+
+        let (count, bad) = reader.await.unwrap();
+        assert_eq!(bad, 0, "corrupted echoes under concurrent split polling");
+        assert_eq!(count, 2000, "all chunks must be echoed");
+    }
+
     // ─── Reality ClientHello session_id seal ──────────────────────────────────
 
     /// The 32-byte session_id must decrypt, under the key/nonce/AAD a real
     /// Reality server reconstructs, to the authentication payload
-    /// (`[1, 8, 2, 0] || timestamp || short_id`). Asserting the plaintext —
+    /// (`[1, 8, 1, 0] || timestamp || short_id`). Asserting the plaintext —
     /// not just the length — is what proves the server could authenticate us.
     #[test]
     fn reality_client_hello_session_id_decrypts_to_auth_payload() {
@@ -1479,7 +1644,12 @@ mod tests {
             .decrypt_in_place_detached(nonce, &aad, &mut buf, Tag::from_slice(tag))
             .expect("session_id must decrypt under the server-derived key");
 
-        assert_eq!(&buf[0..4], &[1, 8, 2, 0], "reality auth header");
+        // ClientVer triple [1, 8, 1] — sing-box's hardcoded value
+        // (common/tls/reality_client.go:186-188). Neither sing-box nor
+        // xray servers validate these bytes; they are part of the
+        // AES-GCM auth payload and the server only checks short_id
+        // and timestamp after decryption.
+        assert_eq!(&buf[0..4], &[1, 8, 1, 0], "reality auth header");
         assert_eq!(&buf[8..16], &reality.short_id, "short_id echoed");
     }
 
@@ -1502,5 +1672,114 @@ mod tests {
         let mut buf = vec![0u8; 50];
         buf[0] = HS_CLIENT_HELLO; // wrong handshake type
         assert!(parse_server_hello(&buf).is_err());
+    }
+
+    // ─── poll_write changed-buffer safety ─────────────────────────────────────
+
+    /// A mock inner stream whose first `poll_write` returns `Pending`
+    /// (after self-waking) so that `drain_pending_write` can't complete
+    /// on the initial seal.  Subsequent calls accept all bytes.
+    struct PendingOnce {
+        pending: bool,
+        written: Vec<u8>,
+    }
+
+    impl AsyncRead for PendingOnce {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for PendingOnce {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.pending {
+                self.pending = false;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            self.written.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl Unpin for PendingOnce {}
+
+    /// After `poll_write` seals a record and the inner stream returns
+    /// `Pending`, the caller is told `Ok(chunk_len)` immediately (the
+    /// record is buffered).  A *second* `poll_write` with a different
+    /// buffer must drain the pending record first, then seal and report
+    /// the *new* buffer's length — never the old record's length.
+    ///
+    /// This is the changed-buffer hazard from the #413 review: before
+    /// the fix the top path returned `Ok(consumed)` (the old record's
+    /// plaintext length) against whatever buffer arrived, sending stale
+    /// bytes while claiming the new buffer was consumed.
+    #[test]
+    fn poll_write_reports_new_chunk_len_after_pending_drain() {
+        let secret = [0x5Au8; 32];
+        let mut stream = RealityTlsStream {
+            inner: Box::new(PendingOnce {
+                pending: true,
+                written: Vec::new(),
+            }),
+            read_key: RecordKey::new(CipherSuite::Aes128GcmSha256, &secret),
+            write_key: RecordKey::new(CipherSuite::Aes128GcmSha256, &secret),
+            read_raw_passthrough: false,
+            write_raw_passthrough: false,
+            read_plain: VecDeque::new(),
+            read_state: StreamReadState::Header {
+                buf: [0; 5],
+                pos: 0,
+            },
+            write_pending: None,
+        };
+
+        use tokio::io::AsyncWriteExt;
+
+        // First write: 10 bytes.  Inner returns Pending → drain returns
+        // Pending → poll_write returns Ok(10) with the record buffered.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let n = stream.write(&[0xAA; 10]).await.unwrap();
+            assert_eq!(n, 10, "first write: chunk_len reported immediately");
+        });
+
+        // The pending record is buffered (not fully drained).
+        assert!(
+            stream.write_pending.is_some(),
+            "record buffered after Pending drain"
+        );
+
+        // Second write: 5 different bytes.  The top path drains the
+        // pending record (inner now accepts), then seals the new buffer.
+        // Must report 5 (the new chunk_len), NOT 10 (the old record).
+        rt.block_on(async {
+            let n = stream.write(&[0xBB; 5]).await.unwrap();
+            assert_eq!(n, 5, "second write: new chunk_len, not old record's length");
+        });
+
+        // The pending record from the second write should also be
+        // drainable (inner accepts everything now).
+        assert!(
+            stream.write_pending.is_none(),
+            "second record drained on this call"
+        );
     }
 }
