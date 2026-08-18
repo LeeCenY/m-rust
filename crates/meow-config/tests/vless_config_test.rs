@@ -1096,3 +1096,30 @@ proxies:
         .count();
     assert_eq!(mux_warns, 0, "smux: key is canonical: no warn expected");
 }
+
+/// D16c: explicit `protocol: yamux` → accepted without warn.
+#[cfg(feature = "mux")]
+#[tokio::test]
+async fn parse_vless_mux_yamux_accepted() {
+    let yaml = r#"
+proxies:
+  - name: v
+    type: vless
+    server: example.com
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    mux:
+      enabled: true
+      protocol: yamux
+"#;
+    let (result, lines) = with_warn_capture_async(load_config_from_str(yaml)).await;
+    result.expect("yamux mux must load");
+    let mux_warns = lines
+        .iter()
+        .filter(|l| l.contains("WARN") && l.to_lowercase().contains("mux"))
+        .count();
+    assert_eq!(
+        mux_warns, 0,
+        "yamux is implemented: no warn expected; captured lines: {lines:?}"
+    );
+}
