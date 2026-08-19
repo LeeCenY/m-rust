@@ -1848,22 +1848,20 @@ async fn put_configs(
     )
     .await
     {
-            Ok(r) => r,
-            Err(e) => {
-                if force {
-                    tracing::error!("config reload forced despite validation error: {e}");
-                    (Default::default(), Vec::new())
-                } else {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(
-                            serde_json::json!({"message": format!("config validation error: {e}")}),
-                        ),
-                    )
-                        .into_response();
-                }
+        Ok(r) => r,
+        Err(e) => {
+            if force {
+                tracing::error!("config reload forced despite validation error: {e}");
+                (Default::default(), Vec::new())
+            } else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"message": format!("config validation error: {e}")})),
+                )
+                    .into_response();
             }
-        };
+        }
+    };
 
     // Cold reload: close all connections with structured log (Class A divergence from upstream)
     let stats = state.tunnel.statistics();

@@ -2626,18 +2626,17 @@ rules:
 
         // `rebuild_from_raw_with_resolver` — used by subscription_refresh
         // and geodata_fetch.
-        let (_, rules) =
-            rebuild_from_raw_with_resolver(&raw, None, Some(dir.path())).expect(
-                "trusted rebuild with the real cache dir must not hard-fail on a file provider",
-            );
+        let (_, rules) = rebuild_from_raw_with_resolver(&raw, None, Some(dir.path())).expect(
+            "trusted rebuild with the real cache dir must not hard-fail on a file provider",
+        );
         assert_eq!(rules.len(), 2);
 
         // `rebuild_from_raw_runtime` — used by meow-api's `PUT /configs`
         // family via `rebuild_from_raw_with_resolver_async`.
-        let (_, rules) =
-            rebuild_from_raw_runtime(&raw, None, &HashMap::new(), Some(dir.path())).expect(
-                "trusted runtime rebuild with the real cache dir must not hard-fail on a file provider",
-            );
+        let (_, rules) = rebuild_from_raw_runtime(&raw, None, &HashMap::new(), Some(dir.path()))
+            .expect(
+            "trusted runtime rebuild with the real cache dir must not hard-fail on a file provider",
+        );
         assert_eq!(rules.len(), 2);
     }
 
