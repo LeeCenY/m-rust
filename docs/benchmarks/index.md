@@ -14,7 +14,7 @@ refactor/cleanup-2026-05 work (M1 + M2).
 | [smallvec-audit-findings.md](smallvec-audit-findings.md) | Task #37 null result: all candidates regress; element types ≥ 16 B make SmallVec a size loss |
 | [hardware.md](hardware.md) | Reference bench host spec |
 | [methodology.md](methodology.md) | Measurement methodology and workload definitions |
-| [binary-size.md](binary-size.md) | Stripped binary sizes by profile + target (ADR-0007 caps) |
+| [binary-size.md](binary-size.md) | Stripped binary sizes by profile + target (ADR-0007 caps); §Post-mux (#412 stack, issue #426) records the post-mux `default` size and isolates the mux-attributable delta (~173–222 KiB) on aarch64/x86_64 — no cap breached, mipsel blocked by #421 |
 | [rule-engine-findings.md](rule-engine-findings.md) | Rule engine profiling notes |
 | [rule-ir-pi-2026-07.md](rule-ir-pi-2026-07.md) | Rule-IR series (#285–#297) on-device benchmark: Raspberry Pi 4 gateway, real 7,528-rule config — 1.8–2.9× match latency, −11.5% live slots, IR build 37.6→96.1 ms |
 | [baseline-2026-04-18.json](baseline-2026-04-18.json) | Raw dhat JSON snapshot at M2 open |

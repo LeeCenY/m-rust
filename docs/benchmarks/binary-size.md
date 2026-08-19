@@ -89,3 +89,72 @@ becomes a reported issue in production.
 
 **Fallback**: if W1 4 KB vs Go fails ADR-0006, change `opt-level = "z"` → `"s"` in the
 release profile — expected to recover inlining budget while retaining most of the size win.
+
+## Post-mux (#412 stack, issue #426)
+
+Measured 2026-08-19 at commit `3b57478` (main tip after PRs #414–#418, the
+`sing-mux` client-side multiplexer for SS/VMess/VLESS/Trojan plus Xray
+Mux.Cool). Cross-compiled on macOS/Apple Silicon with cargo-zigbuild + zig
+0.13.0, same release profile as above (`lto=fat, strip=true,
+codegen-units=1, panic=abort, opt-level="z"`, mimalloc allocator). `mux` is
+in the `full` bundle (`meow-app/Cargo.toml`), so it is part of every
+`default` build; it is excluded from `minimal` by design (ADR-0007 §1) and
+that profile is unaffected.
+
+**mipsel-unknown-linux-musl not measured**: blocked by #421 (`mux` uses
+`std::sync::atomic::AtomicU64` directly instead of
+`meow_common::atomic::AtomicU`, and mipsel has no 64-bit atomics — the
+`default` build does not compile for this target until #421 lands). Follow
+up once #421 merges.
+
+### `default` profile — absolute size vs. cap
+
+| Target | Stripped size (mux on) | Cap (ADR-0007 §2) | Headroom | Status |
+|--------|------------------------|--------------------|----------|--------|
+| `aarch64-unknown-linux-musl` | 11,196,256 B (~10.68 MiB) | 18 MiB (18,874,368 B) | 7,678,112 B (~7.32 MiB), 59.3% used | ✓ under cap |
+| `x86_64-unknown-linux-musl` | 14,238,600 B (~13.58 MiB) | 20 MiB (20,971,520 B) | 6,732,920 B (~6.42 MiB), 67.9% used | ✓ under cap |
+| `mipsel-unknown-linux-musl` | not measured (blocked by #421) | 16 MiB (16,777,216 B) | — | — |
+
+No cap is breached or threatened; **no ADR-0007 amendment is required** for
+this change (ADR-0007 §6 only requires an amendment when a feature pushes a
+cap past its current value).
+
+### Mux-attributable delta (mux on vs. mux off, same commit)
+
+To isolate what the #412 stack itself costs — as opposed to the ~4 months of
+unrelated feature growth since the last recorded `default` measurement below
+— both targets were also built with every `full` feature except `mux`
+(`--no-default-features --features
+ss,trojan,vless,vless-vision,vless-encryption,vmess,snell,hysteria2,anytls,ech-tls-tunnel,dns-server,dns-encrypted,listener-http,listener-socks5,listener-tproxy,listener-mixed,listener-tun,boring-tls`),
+same commit, same release profile:
+
+| Target | mux off | mux on | Mux delta |
+|--------|---------|--------|-----------|
+| `aarch64-unknown-linux-musl` | 11,018,768 B (~10.51 MiB) | 11,196,256 B (~10.68 MiB) | +177,488 B (~173 KiB, +1.6%) |
+| `x86_64-unknown-linux-musl` | 14,010,968 B (~13.36 MiB) | 14,238,600 B (~13.58 MiB) | +227,632 B (~222 KiB, +1.6%) |
+
+The `mux` module itself (~5.5 kLoC across `crates/meow-proxy/src/mux/`) adds
+well under 1 MiB on both hard-gated targets — small relative to the caps'
+headroom. The genuinely new dependencies are `yamux` 0.14,
+`nohash-hasher`, and `static_assertions` (`tokio-util` and `h2` were already
+transitive deps of the axum/hyper/tonic stack before #412, confirmed via
+`git diff d50e6f6..3b57478 -- Cargo.lock`).
+
+### Delta vs. last recorded `default` baseline (2026-04-18, above)
+
+| Target | 2026-04-18 `default` | 2026-08-19 `default` (post-mux) | Delta | % |
+|--------|----------------------|----------------------------------|-------|---|
+| `aarch64-unknown-linux-musl` | 6,371,432 B (~6.07 MiB) | 11,196,256 B (~10.68 MiB) | +4,824,824 B | +75.7% |
+| `x86_64-unknown-linux-musl` | 7,788,120 B (~7.43 MiB) | 14,238,600 B (~13.58 MiB) | +6,450,480 B | +82.8% |
+
+This total delta is **not** attributable to mux — per the isolated
+measurement above, mux is only ~173–222 KiB of it. The remainder comes from
+everything else that landed on `default` between April and August 2026
+(VLESS Vision/Encryption, VMess, Snell, Hysteria2, AnyTLS, the
+`ech-tls-tunnel` bundle, `dns-encrypted`, `listener-tun`, and notably
+`boring-tls` joining the `default` feature set for REALITY/uTLS — issue
+#377 — which statically links BoringSSL and is a much larger single
+contributor than mux). None of those were measured against `default` at
+the time they landed either; this section only closes the mux-specific gap
+that issue #426 asked for. A follow-up audit to re-baseline `default` size
+against the full feature history is out of scope here.
