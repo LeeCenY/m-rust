@@ -151,8 +151,8 @@ impl PacketReader {
     }
 }
 
-struct PacketWriter {
-    stream: tokio::io::WriteHalf<MuxStream>,
+struct PacketWriter<W = tokio::io::WriteHalf<MuxStream>> {
+    stream: W,
     /// Cancellation-safe write state: the combined frame (length prefix
     /// and data) and the byte offset already written. A `write_datagram`
     /// future dropped mid-write re-enters and resumes from `offset`
@@ -161,8 +161,8 @@ struct PacketWriter {
     pending: Option<(bytes::Bytes, usize)>,
 }
 
-impl PacketWriter {
-    fn new(stream: tokio::io::WriteHalf<MuxStream>) -> Self {
+impl<W: tokio::io::AsyncWrite + Unpin> PacketWriter<W> {
+    fn new(stream: W) -> Self {
         Self {
             stream,
             pending: None,
@@ -170,6 +170,30 @@ impl PacketWriter {
     }
 
     async fn write_datagram(&mut self, data: &[u8]) -> std::io::Result<()> {
+        // A pending frame may only be resumed by a retry carrying the
+        // *same* datagram — otherwise the new datagram would be silently
+        // dropped while its bytes are reported as sent. If the new call
+        // carries different data: before any byte hit the wire the stale
+        // frame is simply discarded; after a partial write the length
+        // prefix is committed, so the frame must be completed with the
+        // original bytes — reject the changed buffer instead, mirroring
+        // `H2Stream::poll_write`'s changed-buffer guard (`h2_common.rs`).
+        // The pending frame is kept so a retry with the original data
+        // can still complete it without desyncing the peer framing.
+        if let Some((frame, offset)) = &self.pending {
+            if &frame[2..] != data {
+                if *offset == 0 {
+                    self.pending = None;
+                } else {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "mux: datagram changed after a cancelled partial write; \
+                         the in-flight frame must be retried with the same data",
+                    ));
+                }
+            }
+        }
+
         // Prepare the combined frame on first entry (or after the
         // previous one completed).  Owning the bytes is required because
         // the caller's `&[u8]` may be gone after cancellation.
@@ -577,6 +601,86 @@ mod tests {
         .unwrap();
         assert_eq!(&buf[..n], b"pong");
         server.await.unwrap();
+    }
+
+    /// Poll `write_datagram(data)` exactly once with a no-op waker and
+    /// drop the future — a deterministic mid-write cancellation.  Returns
+    /// the offset the writer parked at.
+    fn cancel_one_write<W: tokio::io::AsyncWrite + Unpin>(
+        writer: &mut PacketWriter<W>,
+        data: &[u8],
+    ) -> usize {
+        use std::future::Future;
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let mut fut = Box::pin(writer.write_datagram(data));
+        assert!(
+            fut.as_mut().poll(&mut cx).is_pending(),
+            "the write must park mid-frame for the cancellation test"
+        );
+        drop(fut);
+        writer.pending.as_ref().expect("frame must survive").1
+    }
+
+    /// A retry with the same datagram resumes the cancelled frame: the
+    /// peer sees exactly one well-formed frame, and the next datagram
+    /// starts on a clean boundary.
+    #[tokio::test]
+    async fn cancelled_partial_write_resumes_with_same_data() {
+        let (client, mut peer) = tokio::io::duplex(4);
+        let mut writer = PacketWriter::new(client);
+        // Frame is 6 bytes ([len u16][AAAA]); the 4-byte pipe takes the
+        // first 4 and parks the write.
+        assert_eq!(cancel_one_write(&mut writer, b"AAAA"), 4);
+        let mut head = [0u8; 4];
+        peer.read_exact(&mut head).await.unwrap();
+        writer.write_datagram(b"AAAA").await.unwrap();
+        let mut tail = [0u8; 2];
+        peer.read_exact(&mut tail).await.unwrap();
+        assert_eq!([head.as_slice(), &tail].concat(), b"\x00\x04AAAA");
+        // Offset bookkeeping reset: the next datagram frames cleanly.
+        writer.write_datagram(b"Z").await.unwrap();
+        let mut next = [0u8; 3];
+        peer.read_exact(&mut next).await.unwrap();
+        assert_eq!(&next, b"\x00\x01Z");
+    }
+
+    /// Regression for issue #422: a retry carrying a *different* datagram
+    /// after a cancelled partial write must error (not finish the stale
+    /// frame and report the new datagram as sent), and must keep the
+    /// committed frame intact so the original data can still complete it.
+    #[tokio::test]
+    async fn cancelled_partial_write_rejects_different_data() {
+        let (client, mut peer) = tokio::io::duplex(4);
+        let mut writer = PacketWriter::new(client);
+        assert_eq!(cancel_one_write(&mut writer, b"AAAA"), 4);
+        let err = writer.write_datagram(b"BBBB").await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        // The in-flight frame survives the rejected call: the original
+        // datagram still completes without desyncing the peer framing.
+        let mut head = [0u8; 4];
+        peer.read_exact(&mut head).await.unwrap();
+        writer.write_datagram(b"AAAA").await.unwrap();
+        let mut tail = [0u8; 2];
+        peer.read_exact(&mut tail).await.unwrap();
+        assert_eq!([head.as_slice(), &tail].concat(), b"\x00\x04AAAA");
+    }
+
+    /// A cancelled write that never reached the wire (offset 0) has
+    /// committed nothing: different data on the next call replaces the
+    /// stale frame instead of erroring.
+    #[tokio::test]
+    async fn cancelled_unwritten_frame_replaced_by_new_data() {
+        let (mut client, mut peer) = tokio::io::duplex(4);
+        // Fill the pipe so the first write cannot make progress.
+        client.write_all(&[0xEE; 4]).await.unwrap();
+        let mut writer = PacketWriter::new(client);
+        assert_eq!(cancel_one_write(&mut writer, b"AAAA"), 0);
+        let mut filler = [0u8; 4];
+        peer.read_exact(&mut filler).await.unwrap();
+        writer.write_datagram(b"BB").await.unwrap();
+        let mut frame = [0u8; 4];
+        peer.read_exact(&mut frame).await.unwrap();
+        assert_eq!(&frame, b"\x00\x02BB");
     }
 
     /// Live interop probe against a running sing-box VLESS mux inbound
