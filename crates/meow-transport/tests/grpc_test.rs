@@ -12,6 +12,8 @@
 //! | C  | `grpc_content_type_header` — request must carry `content-type: application/grpc` |
 //! | D  | `grpc_round_trip` — 4 MiB loopback echo through a real h2 server |
 //! | E  | `grpc_round_trip_with_deferred_response` — server withholds response HEADERS until the first client hunk (issue #377) |
+//! | F  | `grpc_poll_write_rejects_changed_buffer_after_pending` — changed-buffer guard (issue #433) |
+//! | G  | `grpc_poll_write_same_buffer_retry_succeeds_after_pending` — legitimate same-buffer retry still completes (issue #433) |
 
 mod support;
 
@@ -314,5 +316,155 @@ async fn grpc_round_trip_with_deferred_response() {
     assert_eq!(
         &got, b"ping",
         "round-trip bytes must survive the deferred response"
+    );
+}
+
+// ─── F/G: Changed-buffer guard after Pending (issue #433) ─────────────────────
+
+/// Spawn an in-process h2 server over one end of a duplex pipe that accepts a
+/// single request, sends a 200 response, and then withholds flow-control
+/// capacity: it never releases the request body's receive window until it gets
+/// a message on `release_rx` (if ever), after which it drains and releases
+/// everything. Keeping the window shut forces the client's `poll_write` into
+/// the `Pending` + stashed-frame state that issue #433 is about.
+fn spawn_capacity_hoarding_server(
+    server_io: tokio::io::DuplexStream,
+    release_rx: tokio::sync::oneshot::Receiver<()>,
+) {
+    tokio::spawn(async move {
+        let Ok(mut conn) = h2::server::handshake(server_io).await else {
+            return;
+        };
+        let Some(Ok((request, mut respond))) = conn.accept().await else {
+            return;
+        };
+        // Drive connection-level frames in the background.
+        tokio::spawn(async move { while conn.accept().await.is_some() {} });
+
+        let response = http::Response::builder()
+            .status(200)
+            .body(())
+            .expect("resp");
+        let _ = respond.send_response(response, false);
+
+        // Consume DATA frames but do NOT release capacity — the client's
+        // send window (65535 initial) empties and stays empty.
+        let mut body = request.into_body();
+        let mut release_rx = release_rx;
+        let mut held: usize = 0;
+        loop {
+            tokio::select! {
+                chunk = body.data() => match chunk {
+                    Some(Ok(chunk)) => held += chunk.len(),
+                    _ => return, // EOS or stream error — client went away
+                },
+                _ = &mut release_rx => break,
+            }
+        }
+        // Reopen the window: release everything held so far, then keep
+        // draining + releasing so the retried write completes.
+        let _ = body.flow_control().release_capacity(held);
+        while let Some(Ok(chunk)) = body.data().await {
+            let _ = body.flow_control().release_capacity(chunk.len());
+        }
+        // Keep the body alive so the stream is not reset while the client
+        // still has a write outstanding.
+        std::mem::forget(body);
+    });
+}
+
+/// Exhaust the client's h2 send window so the next write stashes its frame and
+/// returns `Pending`, then interrupt that write, leaving `pending_write` set.
+/// Returns the connected stream with a stashed frame for `pending_payload`.
+async fn gun_stream_with_stashed_frame(
+    client_io: tokio::io::DuplexStream,
+    pending_payload: &[u8],
+) -> Box<dyn meow_transport::Stream> {
+    let layer = GrpcLayer::new(GrpcConfig::default());
+    let mut stream = layer
+        .connect(Box::new(client_io))
+        .await
+        .expect("grpc connect");
+
+    // One 65535-byte payload encodes to a 65544-byte gun frame — larger than
+    // the initial 65535-byte h2 send window — so after this write the window
+    // is fully exhausted (the server never releases capacity on its own).
+    let fill = vec![0xAA; 65535];
+    tokio::time::timeout(Duration::from_secs(5), stream.write(&fill))
+        .await
+        .expect("window-filling write must complete")
+        .expect("window-filling write");
+
+    // This write cannot get capacity: poll_write encodes + stashes the frame
+    // and returns Pending. The timeout drops the write future at that await
+    // point (cancellation), leaving pending_write set — the #433 setup.
+    let interrupted =
+        tokio::time::timeout(Duration::from_millis(200), stream.write(pending_payload)).await;
+    assert!(
+        interrupted.is_err(),
+        "write must be blocked on flow control (send window exhausted)"
+    );
+
+    stream
+}
+
+/// F: `grpc_poll_write_rejects_changed_buffer_after_pending`
+///
+/// Regression test for issue #433. After `poll_write` stashes an encoded gun
+/// frame and returns `Pending` (h2 send window exhausted), re-polling with a
+/// *different* buffer must fail with `InvalidInput` — before the fix the
+/// stashed stale frame was silently sent while `Ok(new_buf.len())` was
+/// reported, corrupting the stream with no error. Mirrors the `H2Stream`
+/// guard test `poll_write_rejects_changed_buffer_after_pending` (h2mux).
+#[tokio::test]
+async fn grpc_poll_write_rejects_changed_buffer_after_pending() {
+    let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+    let (_release_tx, release_rx) = tokio::sync::oneshot::channel();
+    spawn_capacity_hoarding_server(server_io, release_rx);
+
+    let pending = vec![0xBB; 100];
+    let mut stream = gun_stream_with_stashed_frame(client_io, &pending).await;
+
+    // Re-poll with a different buffer — the guard must reject it immediately.
+    // Without the guard this write just parks on poll_capacity forever (the
+    // window never reopens), so a hang here is itself a regression signal.
+    let different = vec![0xCC; 50];
+    let result = tokio::time::timeout(Duration::from_secs(5), stream.write(&different))
+        .await
+        .expect("changed-buffer write hung — the changed-buffer guard is missing");
+    let err = result.expect_err("changed buffer after Pending must be rejected");
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::InvalidInput,
+        "expected InvalidInput, got: {err}"
+    );
+}
+
+/// G: `grpc_poll_write_same_buffer_retry_succeeds_after_pending`
+///
+/// Companion to F: the guard must not false-positive. Retrying the write with
+/// the *same* buffer after `Pending` is the contract-conforming path and must
+/// still complete once the server releases flow-control capacity, reporting
+/// the full buffer length.
+#[tokio::test]
+async fn grpc_poll_write_same_buffer_retry_succeeds_after_pending() {
+    let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    spawn_capacity_hoarding_server(server_io, release_rx);
+
+    let pending = vec![0xBB; 100];
+    let mut stream = gun_stream_with_stashed_frame(client_io, &pending).await;
+
+    // Reopen the window, then retry with the SAME buffer: the stashed frame
+    // is sent and the write reports the full payload length.
+    release_tx.send(()).expect("server task alive");
+    let n = tokio::time::timeout(Duration::from_secs(5), stream.write(&pending))
+        .await
+        .expect("same-buffer retry must complete once capacity is released")
+        .expect("same-buffer retry must succeed");
+    assert_eq!(
+        n,
+        pending.len(),
+        "retry must report the full payload length"
     );
 }
