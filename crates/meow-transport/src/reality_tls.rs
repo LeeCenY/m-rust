@@ -3,7 +3,7 @@ use std::{
     io,
     pin::Pin,
     task::{Context, Poll},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use aes_gcm::{
@@ -38,6 +38,28 @@ const HS_FINISHED: u8 = 20;
 const TLS_AES_128_GCM_SHA256: u16 = 0x1301;
 
 const GROUP_X25519: u16 = 0x001d;
+
+// ─── Pre-authentication server-flight bounds (issue #430) ─────────────────
+//
+// Everything the loop below accepts before `Finished` is unauthenticated:
+// the REALITY HMAC check (`verify_reality_certificate`) only runs after the
+// loop exits. Without a cap, a peer that merely echoes the ClientHello
+// `session_id` — which is enough to get past `read_plain_handshake` and
+// derive valid handshake keys, but says nothing about who they are — could
+// stream EncryptedExtensions/Certificate/CertificateVerify messages forever
+// and grow `transcript` without bound. A real TLS 1.3 server flight is a
+// few KB; `read_record` already caps a single record at 18 KiB, so a
+// legitimate flight cannot come close to either limit below. Mirrors
+// `MAX_GUN_FRAME_LEN` in `grpc.rs` and the size caps in `ws.rs`.
+const MAX_PRE_AUTH_HS_MESSAGES: usize = 32;
+const MAX_PRE_AUTH_TRANSCRIPT_LEN: usize = 64 * 1024;
+
+/// Upper bound on the whole REALITY handshake (ClientHello write through the
+/// authenticated Finished exchange). Independent of the size cap above: a
+/// peer that stays within the caps but drips messages slowly, or simply
+/// never sends `Finished`, would otherwise pin the dial task (and its
+/// buffers) open indefinitely.
+const REALITY_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 pub(crate) struct RealityTlsLayer {
@@ -84,7 +106,16 @@ impl RealityTlsLayer {
 #[async_trait::async_trait]
 impl Transport for RealityTlsLayer {
     async fn connect(&self, inner: Box<dyn Stream>) -> Result<Box<dyn Stream>> {
-        let state = reality_handshake(inner, &self.server_name, &self.alpn, &self.reality).await?;
+        let state = tokio::time::timeout(
+            REALITY_HANDSHAKE_TIMEOUT,
+            reality_handshake(inner, &self.server_name, &self.alpn, &self.reality),
+        )
+        .await
+        .map_err(|_| {
+            TransportError::Tls(format!(
+                "Reality TLS: handshake did not complete within {REALITY_HANDSHAKE_TIMEOUT:?}"
+            ))
+        })??;
         Ok(spawn_reality_stream(state))
     }
 }
@@ -145,8 +176,7 @@ async fn reality_handshake(
 
     let mut handshake_buf = VecDeque::new();
     let mut leaf_cert = None;
-    let mut saw_encrypted_extensions = false;
-    let mut saw_certificate_verify = false;
+    let mut flight = ServerFlightGuard::default();
     let server_finished;
 
     loop {
@@ -155,25 +185,31 @@ async fn reality_handshake(
             TransportError::Tls("Reality TLS: decrypted empty handshake record".into())
         })?;
         match msg.typ {
-            HS_ENCRYPTED_EXTENSIONS => {
-                transcript.extend_from_slice(&msg.raw);
-                saw_encrypted_extensions = true;
-            }
-            HS_CERTIFICATE => {
-                leaf_cert = Some(parse_leaf_certificate(&msg.body)?);
-                transcript.extend_from_slice(&msg.raw);
-            }
-            HS_CERTIFICATE_VERIFY => {
-                transcript.extend_from_slice(&msg.raw);
-                saw_certificate_verify = true;
+            HS_ENCRYPTED_EXTENSIONS | HS_CERTIFICATE | HS_CERTIFICATE_VERIFY => {
+                flight.admit(&mut transcript, &msg)?;
+                if msg.typ == HS_CERTIFICATE {
+                    leaf_cert = Some(parse_leaf_certificate(&msg.body)?);
+                }
             }
             HS_FINISHED => {
+                if !flight.complete() {
+                    return Err(TransportError::Tls(
+                        "Reality TLS: incomplete server handshake".into(),
+                    ));
+                }
                 server_finished = msg.raw;
                 verify_finished(&hs.server_secret, &transcript, &msg.body)?;
                 break;
             }
             HS_NEW_SESSION_TICKET => {
-                // Some servers are eager with post-handshake tickets. Ignore.
+                // NewSessionTicket is a TLS 1.3 *post*-handshake message; a
+                // compliant server never sends it before Finished. Treating
+                // it as ignorable (as the old code did) let an attacker
+                // spin the loop forever without ever touching the transcript
+                // caps below — reject it outright instead (issue #430).
+                return Err(TransportError::Tls(
+                    "Reality TLS: NewSessionTicket before Finished".into(),
+                ));
             }
             other => {
                 return Err(TransportError::Tls(format!(
@@ -183,11 +219,6 @@ async fn reality_handshake(
         }
     }
 
-    if !saw_encrypted_extensions || !saw_certificate_verify {
-        return Err(TransportError::Tls(
-            "Reality TLS: incomplete server handshake".into(),
-        ));
-    }
     let leaf_cert =
         leaf_cert.ok_or_else(|| TransportError::Tls("Reality TLS: missing certificate".into()))?;
     verify_reality_certificate(&leaf_cert, &reality_auth_key)?;
@@ -855,6 +886,79 @@ struct HandshakeMessage {
     typ: u8,
     body: Vec<u8>,
     raw: Vec<u8>,
+}
+
+/// Enforces the pre-authentication server-flight bounds from issue #430:
+/// `EncryptedExtensions`, `Certificate` and `CertificateVerify` must each
+/// appear at most once, in that order, and the running transcript may not
+/// exceed [`MAX_PRE_AUTH_HS_MESSAGES`] messages / [`MAX_PRE_AUTH_TRANSCRIPT_LEN`]
+/// bytes. `admit` is the only way `transcript` grows during the loop in
+/// [`reality_handshake`], so every accepted message is checked before it is
+/// appended.
+#[derive(Default)]
+struct ServerFlightGuard {
+    message_count: usize,
+    saw_encrypted_extensions: bool,
+    saw_certificate: bool,
+    saw_certificate_verify: bool,
+}
+
+impl ServerFlightGuard {
+    /// Validate and, if accepted, append `msg.raw` to `transcript`. Only
+    /// called for `EncryptedExtensions` / `Certificate` / `CertificateVerify`
+    /// — `Finished` and `NewSessionTicket` are handled by the caller.
+    fn admit(&mut self, transcript: &mut Vec<u8>, msg: &HandshakeMessage) -> Result<()> {
+        self.message_count += 1;
+        if self.message_count > MAX_PRE_AUTH_HS_MESSAGES {
+            return Err(TransportError::Tls(format!(
+                "Reality TLS: server flight exceeded {MAX_PRE_AUTH_HS_MESSAGES} pre-authentication handshake messages"
+            )));
+        }
+        if transcript.len() + msg.raw.len() > MAX_PRE_AUTH_TRANSCRIPT_LEN {
+            return Err(TransportError::Tls(format!(
+                "Reality TLS: server flight transcript exceeded {MAX_PRE_AUTH_TRANSCRIPT_LEN} bytes"
+            )));
+        }
+        match msg.typ {
+            HS_ENCRYPTED_EXTENSIONS => {
+                if self.saw_encrypted_extensions || self.saw_certificate || self.saw_certificate_verify
+                {
+                    return Err(TransportError::Tls(
+                        "Reality TLS: unexpected EncryptedExtensions in server flight".into(),
+                    ));
+                }
+                self.saw_encrypted_extensions = true;
+            }
+            HS_CERTIFICATE => {
+                if !self.saw_encrypted_extensions || self.saw_certificate || self.saw_certificate_verify
+                {
+                    return Err(TransportError::Tls(
+                        "Reality TLS: unexpected Certificate in server flight".into(),
+                    ));
+                }
+                self.saw_certificate = true;
+            }
+            HS_CERTIFICATE_VERIFY => {
+                if !self.saw_certificate || self.saw_certificate_verify {
+                    return Err(TransportError::Tls(
+                        "Reality TLS: unexpected CertificateVerify in server flight".into(),
+                    ));
+                }
+                self.saw_certificate_verify = true;
+            }
+            other => unreachable!(
+                "ServerFlightGuard::admit called for handshake type {other}, which is not part of the pre-Finished flight"
+            ),
+        }
+        transcript.extend_from_slice(&msg.raw);
+        Ok(())
+    }
+
+    /// True once all three mandatory pre-`Finished` flight messages have
+    /// been seen exactly once, in order.
+    fn complete(&self) -> bool {
+        self.saw_encrypted_extensions && self.saw_certificate && self.saw_certificate_verify
+    }
 }
 
 fn pop_handshake_message(buf: &mut VecDeque<u8>) -> Option<HandshakeMessage> {
@@ -1781,5 +1885,298 @@ mod tests {
             stream.write_pending.is_none(),
             "second record drained on this call"
         );
+    }
+
+    // ─── Pre-auth server-flight caps (issue #430) ─────────────────────────────
+
+    fn handshake_message(typ: u8, body: Vec<u8>) -> HandshakeMessage {
+        let mut raw = vec![typ];
+        put_u24(body.len(), &mut raw);
+        raw.extend_from_slice(&body);
+        HandshakeMessage { typ, body, raw }
+    }
+
+    #[test]
+    fn server_flight_guard_accepts_well_formed_flight() {
+        let mut transcript = Vec::new();
+        let mut flight = ServerFlightGuard::default();
+        flight
+            .admit(
+                &mut transcript,
+                &handshake_message(HS_ENCRYPTED_EXTENSIONS, vec![1, 2, 3]),
+            )
+            .expect("EncryptedExtensions accepted");
+        flight
+            .admit(
+                &mut transcript,
+                &handshake_message(HS_CERTIFICATE, vec![4, 5]),
+            )
+            .expect("Certificate accepted");
+        flight
+            .admit(
+                &mut transcript,
+                &handshake_message(HS_CERTIFICATE_VERIFY, vec![6]),
+            )
+            .expect("CertificateVerify accepted");
+        assert!(flight.complete());
+        // transcript accumulated exactly the three framed messages, in order.
+        let expected: Vec<u8> = [
+            handshake_message(HS_ENCRYPTED_EXTENSIONS, vec![1, 2, 3]).raw,
+            handshake_message(HS_CERTIFICATE, vec![4, 5]).raw,
+            handshake_message(HS_CERTIFICATE_VERIFY, vec![6]).raw,
+        ]
+        .concat();
+        assert_eq!(transcript, expected);
+    }
+
+    #[test]
+    fn server_flight_guard_rejects_duplicate_encrypted_extensions() {
+        let mut transcript = Vec::new();
+        let mut flight = ServerFlightGuard::default();
+        flight
+            .admit(
+                &mut transcript,
+                &handshake_message(HS_ENCRYPTED_EXTENSIONS, vec![]),
+            )
+            .expect("first EncryptedExtensions accepted");
+        let err = flight
+            .admit(
+                &mut transcript,
+                &handshake_message(HS_ENCRYPTED_EXTENSIONS, vec![]),
+            )
+            .expect_err("second EncryptedExtensions must be rejected");
+        assert!(matches!(err, TransportError::Tls(msg) if msg.contains("EncryptedExtensions")));
+    }
+
+    #[test]
+    fn server_flight_guard_rejects_certificate_before_encrypted_extensions() {
+        let mut transcript = Vec::new();
+        let mut flight = ServerFlightGuard::default();
+        let err = flight
+            .admit(&mut transcript, &handshake_message(HS_CERTIFICATE, vec![]))
+            .expect_err("Certificate before EncryptedExtensions must be rejected");
+        assert!(matches!(err, TransportError::Tls(msg) if msg.contains("Certificate")));
+    }
+
+    #[test]
+    fn server_flight_guard_rejects_certificate_verify_before_certificate() {
+        let mut transcript = Vec::new();
+        let mut flight = ServerFlightGuard::default();
+        flight
+            .admit(
+                &mut transcript,
+                &handshake_message(HS_ENCRYPTED_EXTENSIONS, vec![]),
+            )
+            .expect("EncryptedExtensions accepted");
+        let err = flight
+            .admit(
+                &mut transcript,
+                &handshake_message(HS_CERTIFICATE_VERIFY, vec![]),
+            )
+            .expect_err("CertificateVerify before Certificate must be rejected");
+        assert!(matches!(err, TransportError::Tls(msg) if msg.contains("CertificateVerify")));
+    }
+
+    /// Pins the fix's message-count cap: a peer that keeps sending
+    /// (distinct-looking, but never-completing) flight messages must be cut
+    /// off at `MAX_PRE_AUTH_HS_MESSAGES`, not accumulate forever. We drive
+    /// this directly against `ServerFlightGuard` — the real state machine
+    /// would reject a duplicate `EncryptedExtensions` long before the count
+    /// cap fires (see the duplicate test above), so this isolates the cap
+    /// itself rather than the ordering check.
+    #[test]
+    fn server_flight_guard_enforces_message_count_cap() {
+        let mut transcript = Vec::new();
+        let mut flight = ServerFlightGuard {
+            message_count: MAX_PRE_AUTH_HS_MESSAGES,
+            ..Default::default()
+        };
+        let err = flight
+            .admit(
+                &mut transcript,
+                &handshake_message(HS_ENCRYPTED_EXTENSIONS, vec![]),
+            )
+            .expect_err("message beyond the count cap must be rejected");
+        assert!(
+            matches!(err, TransportError::Tls(msg) if msg.contains("pre-authentication handshake messages"))
+        );
+    }
+
+    /// Pins the fix's cumulative-byte cap.
+    #[test]
+    fn server_flight_guard_enforces_transcript_byte_cap() {
+        let mut transcript = vec![0u8; MAX_PRE_AUTH_TRANSCRIPT_LEN - 4];
+        let mut flight = ServerFlightGuard::default();
+        // A 5-byte message (the minimum non-empty framed message) pushes the
+        // transcript one byte past the cap.
+        let err = flight
+            .admit(
+                &mut transcript,
+                &handshake_message(HS_ENCRYPTED_EXTENSIONS, vec![0]),
+            )
+            .expect_err("message pushing transcript past the byte cap must be rejected");
+        assert!(matches!(err, TransportError::Tls(msg) if msg.contains("bytes")));
+    }
+
+    // ─── Full handshake: unbounded pre-auth flood is rejected (issue #430) ────
+
+    /// Extract the client's X25519 key share from a raw (framed) ClientHello,
+    /// mirroring the layout `build_reality_client_hello` writes, so the fake
+    /// server below can complete the ECDH and derive matching handshake keys.
+    fn extract_client_key_share(client_hello: &[u8]) -> [u8; 32] {
+        assert_eq!(client_hello[0], HS_CLIENT_HELLO);
+        let mut pos = 4 + 2 + 32; // header + legacy_version + random
+        let sid_len = client_hello[pos] as usize;
+        pos += 1 + sid_len;
+        let cs_len = u16::from_be_bytes([client_hello[pos], client_hello[pos + 1]]) as usize;
+        pos += 2 + cs_len;
+        let cm_len = client_hello[pos] as usize;
+        pos += 1 + cm_len;
+        let ext_len = u16::from_be_bytes([client_hello[pos], client_hello[pos + 1]]) as usize;
+        pos += 2;
+        let exts_end = pos + ext_len;
+        while pos < exts_end {
+            let typ = u16::from_be_bytes([client_hello[pos], client_hello[pos + 1]]);
+            let len = u16::from_be_bytes([client_hello[pos + 2], client_hello[pos + 3]]) as usize;
+            let data = &client_hello[pos + 4..pos + 4 + len];
+            if typ == 51 {
+                // ClientHello key_share carries a 2-byte list length, then
+                // one KeyShareEntry (group u16, len u16, key bytes).
+                let group = u16::from_be_bytes([data[2], data[3]]);
+                assert_eq!(group, GROUP_X25519, "test only supports X25519");
+                let mut key = [0u8; 32];
+                key.copy_from_slice(&data[6..38]);
+                return key;
+            }
+            pos += 4 + len;
+        }
+        panic!("ClientHello carried no key_share extension");
+    }
+
+    /// Build a minimal, well-formed plaintext ServerHello: TLS 1.3, echoes
+    /// `session_id`, negotiates `TLS_AES_128_GCM_SHA256`, and carries an
+    /// unwrapped (server-style) X25519 `key_share`. Matches what
+    /// `parse_server_hello` expects.
+    fn build_fake_server_hello(session_id: &[u8], server_public: &[u8; 32]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x03, 0x03]);
+        body.extend_from_slice(&[0xAAu8; 32]); // random; must not be the HRR magic
+        body.push(session_id.len() as u8);
+        body.extend_from_slice(session_id);
+        put_u16(TLS_AES_128_GCM_SHA256, &mut body);
+        body.push(0); // compression
+
+        let mut exts = Vec::new();
+        push_ext(&mut exts, 43, &[0x03, 0x04]); // supported_versions: TLS 1.3
+        let mut key_share_entry = Vec::new();
+        put_u16(GROUP_X25519, &mut key_share_entry);
+        put_u16(server_public.len() as u16, &mut key_share_entry);
+        key_share_entry.extend_from_slice(server_public);
+        push_ext(&mut exts, 51, &key_share_entry);
+
+        put_u16(exts.len() as u16, &mut body);
+        body.extend_from_slice(&exts);
+
+        let mut hello = vec![HS_SERVER_HELLO];
+        put_u24(body.len(), &mut hello);
+        hello.extend_from_slice(&body);
+        hello
+    }
+
+    /// Drives `reality_handshake` against an in-memory duplex peer that
+    /// completes the ServerHello key exchange like a real (or on-path
+    /// attacker) peer would, then floods oversized `EncryptedExtensions`
+    /// messages instead of ever sending `Finished`. Before the fix this grew
+    /// `transcript` without bound; asserts it now errors out immediately
+    /// after the state-machine's duplicate check rejects the second message,
+    /// rather than after accumulating any of the flood.
+    #[tokio::test]
+    async fn reality_handshake_rejects_unbounded_encrypted_extensions_flood() {
+        let (client_io, server_io): (tokio::io::DuplexStream, tokio::io::DuplexStream) =
+            tokio::io::duplex(1024 * 1024);
+
+        let reality = RealityConfig {
+            public_key: [0x11u8; 32],
+            short_id: [1, 2, 3, 4, 5, 6, 7, 8],
+            support_x25519_mlkem768: false,
+        };
+
+        let server_task = tokio::spawn(async move {
+            let mut server_io = server_io;
+
+            let client_hello_record = read_record(&mut server_io)
+                .await
+                .expect("read ClientHello")
+                .expect("ClientHello present");
+            let client_hello = client_hello_record.payload;
+            let client_public = extract_client_key_share(&client_hello);
+            let session_id = client_hello[39..71].to_vec();
+
+            let mut server_eph_private = rand::random::<[u8; 32]>();
+            clamp_x25519_private(&mut server_eph_private);
+            let server_eph_public = x25519_public_from_private(&server_eph_private);
+            let shared_secret =
+                x25519(&server_eph_private, &client_public).expect("ECDH with client key share");
+
+            let server_hello = build_fake_server_hello(&session_id, &server_eph_public);
+            server_io
+                .write_all(&wrap_plain_record(TLS_RECORD_HANDSHAKE, &server_hello).unwrap())
+                .await
+                .expect("write ServerHello");
+            server_io.flush().await.expect("flush ServerHello");
+
+            let mut transcript = client_hello.clone();
+            transcript.extend_from_slice(&server_hello);
+            let hs =
+                HandshakeKeys::derive(CipherSuite::Aes128GcmSha256, &shared_secret, &transcript);
+            let mut server_hs = hs.server;
+
+            // Every EncryptedExtensions below is the largest that fits in a
+            // single TLS record (`read_record`'s 18 KiB cap), so — pre-fix —
+            // a handful of these alone would already push `transcript` past
+            // a hundred KiB with no end in sight.
+            let oversized_ee =
+                handshake_message(HS_ENCRYPTED_EXTENSIONS, vec![0xABu8; 16 * 1024]).raw;
+
+            // First one is legitimate and must be accepted by the client.
+            server_io
+                .write_all(&server_hs.seal(TLS_RECORD_HANDSHAKE, &oversized_ee).unwrap())
+                .await
+                .expect("write first EncryptedExtensions");
+            server_io
+                .flush()
+                .await
+                .expect("flush first EncryptedExtensions");
+
+            // Keep flooding; the client must stop reading well before this
+            // loop's nominal end. Ignore write errors once the client has
+            // hung up (it errors out and drops its side of the duplex).
+            for _ in 0..64 {
+                let record = server_hs.seal(TLS_RECORD_HANDSHAKE, &oversized_ee).unwrap();
+                if server_io.write_all(&record).await.is_err() {
+                    break;
+                }
+                if server_io.flush().await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            reality_handshake(Box::new(client_io), "example.com", &[], &reality),
+        )
+        .await
+        .expect("handshake must not hang while the flood is rejected");
+
+        let Err(err) = result else {
+            panic!("flooded EncryptedExtensions must be rejected, not accepted");
+        };
+        assert!(
+            matches!(&err, TransportError::Tls(msg) if msg.contains("unexpected EncryptedExtensions")),
+            "unexpected error: {err:?}"
+        );
+
+        server_task.await.expect("server task must not panic");
     }
 }
