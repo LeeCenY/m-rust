@@ -15,6 +15,7 @@ pub mod proxy_provider;
 pub mod raw;
 pub mod rule_parser;
 pub mod rule_provider;
+mod safe_path;
 pub mod sub_rules_parser;
 pub mod subscription;
 
@@ -666,6 +667,14 @@ fn rebuild_from_raw_impl(
     // Per-provider `proxy:` overrides resolve against the full registry —
     // groups and provider-sourced proxies included (issue #377).
     let registry_lookup = |name: &str| proxies.get(name).cloned();
+
+    // Fail hard on any rule-provider path that would escape the provider
+    // cache directory — before any fetch or on-disk write happens, so a
+    // hostile `PUT /configs` is rejected without touching the filesystem
+    // (issue #429).
+    if let Some(map) = raw.rule_providers.as_ref() {
+        rule_provider::validate_paths(map, cache_dir)?;
+    }
 
     // Fetch/read rule-provider payload bytes once — the parser-context build
     // scans them for geo keys (issue #277) and the provider load below parses
@@ -2491,5 +2500,82 @@ mod async_guard_tests {
         use std::future::Future;
         use std::pin::Pin;
         let _fut: Pin<Box<dyn Future<Output = _>>> = Box::pin(super::load_config_from_str(""));
+    }
+}
+
+#[cfg(test)]
+mod provider_path_safety_tests {
+    //! Issue #429: rule-provider `path:` containment — a hostile config (e.g.
+    //! via `PUT /configs`) must fail validation before any fetch or write.
+    use super::*;
+
+    #[test]
+    fn rebuild_rejects_rule_provider_path_escaping_cache_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw: raw::RawConfig = serde_yaml::from_str(
+            r#"
+rule-providers:
+  x:
+    type: http
+    behavior: domain
+    format: yaml
+    url: "http://127.0.0.1:1/payload"
+    path: "/etc/cron.d/pwned"
+rules:
+  - "MATCH,DIRECT"
+"#,
+        )
+        .unwrap();
+        let Err(err) = rebuild_from_raw_with_cache_dir(&raw, Some(dir.path()), None) else {
+            panic!("escaping rule-provider path must fail the rebuild");
+        };
+        assert!(err.to_string().contains("escapes"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn rebuild_rejects_file_provider_path_without_cache_dir() {
+        // `rebuild_from_raw` is the `cache_dir = None` path used by runtime
+        // rebuilds (`PUT /configs` goes through `rebuild_from_raw_runtime`,
+        // which shares the same impl): there is no containment root, so a
+        // caller-named file path is a hard error.
+        let raw: raw::RawConfig = serde_yaml::from_str(
+            r#"
+rule-providers:
+  x:
+    type: file
+    behavior: domain
+    path: "/etc/passwd"
+rules:
+  - "MATCH,DIRECT"
+"#,
+        )
+        .unwrap();
+        let Err(err) = rebuild_from_raw(&raw) else {
+            panic!("file provider path without a cache dir must fail the rebuild");
+        };
+        assert!(
+            err.to_string().contains("cache directory"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn rebuild_rejects_traversal_in_rule_provider_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw: raw::RawConfig = serde_yaml::from_str(
+            r#"
+rule-providers:
+  x:
+    type: http
+    behavior: domain
+    url: "http://127.0.0.1:1/payload"
+    path: "../../outside.yaml"
+"#,
+        )
+        .unwrap();
+        let Err(err) = rebuild_from_raw_with_cache_dir(&raw, Some(dir.path()), None) else {
+            panic!("`..` traversal in rule-provider path must fail the rebuild");
+        };
+        assert!(err.to_string().contains("escapes"), "unexpected: {err}");
     }
 }

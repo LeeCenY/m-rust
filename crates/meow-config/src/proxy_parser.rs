@@ -2905,7 +2905,9 @@ tls: true
             health_check: None,
             header: None,
         };
-        let provider = crate::proxy_provider::ProxyProvider::new("airport", &raw, None).unwrap();
+        let cache_dir = path.parent().expect("temp file has a parent dir");
+        let provider =
+            crate::proxy_provider::ProxyProvider::new("airport", &raw, Some(cache_dir)).unwrap();
         provider.refresh().await.unwrap();
         let mut providers = HashMap::new();
         providers.insert("airport".to_string(), Arc::new(provider));
