@@ -13,16 +13,17 @@ use super::smux;
 use super::stream::MuxStreamConn;
 use super::yamux;
 use super::{address, Protocol};
+use meow_common::atomic::{AtomicU, Uint};
 use meow_common::{MeowError, Metadata, ProxyConn, ProxyPacketConn, Result};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::Mutex;
 
@@ -65,10 +66,15 @@ impl Default for MuxOptions {
     }
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64)
+/// Monotonic millis since process start (not wall-clock: immune to clock
+/// steps, which a `SystemTime`-based clock would let defer idle eviction —
+/// see issue #421). On mips32 (no 64-bit atomics) this wraps every ~49.7
+/// days; comparisons must stay in the truncated domain via `wrapping_sub`
+/// (see [`MuxClient::offer`] below and `UdpSession::idle_for`).
+fn now_ms() -> Uint {
+    static START: OnceLock<Instant> = OnceLock::new();
+    let start = START.get_or_init(Instant::now);
+    start.elapsed().as_millis() as Uint
 }
 
 /// One protocol session multiplexing streams over one physical connection.
@@ -297,7 +303,7 @@ pub(crate) struct MuxSession {
     /// with one `compare_exchange`, so the load assessment and the
     /// increment are one atomic step.
     pub(crate) streams: AtomicUsize,
-    pub(crate) last_used_ms: AtomicU64,
+    pub(crate) last_used_ms: AtomicU,
 }
 
 /// Releases a [`MuxSession`] slot when dropped — the cancellation-safe
@@ -467,8 +473,12 @@ impl MuxClient {
             if s.kind.is_dead() {
                 return false;
             }
-            let idle = now.saturating_sub(s.last_used_ms.load(Ordering::SeqCst));
-            s.streams.load(Ordering::SeqCst) > 0 || idle < IDLE_TIMEOUT.as_millis() as u64
+            // Truncated-domain comparison (never widen to u64 first): on
+            // mips32 `Uint` is u32 and wraps every ~49.7 days, so a plain
+            // subtraction must use `wrapping_sub`, matching
+            // `UdpSession::idle_for`.
+            let idle = now.wrapping_sub(s.last_used_ms.load(Ordering::SeqCst));
+            s.streams.load(Ordering::SeqCst) > 0 || idle < IDLE_TIMEOUT.as_millis() as Uint
         });
         let options = &self.options;
         let best = sessions
@@ -541,7 +551,7 @@ impl MuxClient {
             // held, so no concurrent offer can see this session before
             // the slot is reserved.
             streams: AtomicUsize::new(1),
-            last_used_ms: AtomicU64::new(now_ms()),
+            last_used_ms: AtomicU::new(now_ms()),
         });
         sessions.push_back(Arc::clone(&session));
         Ok(session)
@@ -822,6 +832,47 @@ mod tests {
         // The zero-stream session stays reusable within IDLE_TIMEOUT.
         let _s2 = client.open_stream("b.example", 81).await.unwrap();
         assert_eq!(dials.load(Ordering::SeqCst), 1);
+    }
+
+    /// Regression test for issue #421: `offer()`'s idle check must compare
+    /// `last_used_ms` in the truncated `Uint` domain with `wrapping_sub`,
+    /// never widen to `u64` first. `last_used_ms` can end up numerically
+    /// *ahead* of a freshly-read `now_ms()` two ways: a `Uint = u32`
+    /// millisecond clock rolling over on a 32-bit-atomic target (mips32),
+    /// or a monotonic clock read racing itself. A `saturating_sub`-based
+    /// comparison computes `now.saturating_sub(last) == 0` in that case and
+    /// treats the session as freshly used forever, so it can never be
+    /// evicted. `wrapping_sub` recovers the true elapsed distance
+    /// regardless of which side is numerically larger, so a session whose
+    /// stamp reads far in the "future" is still pruned as idle.
+    #[tokio::test]
+    async fn idle_sessions_are_evicted_across_a_wrapped_clock_reading() {
+        let dials = Arc::new(AtomicUsize::new(0));
+        let client = mock_mux_client(Arc::clone(&dials)).await;
+        let s = client.open_stream("a.example", 80).await.unwrap();
+        drop(s);
+        assert_eq!(dials.load(Ordering::SeqCst), 1);
+
+        // Force the session's last-used stamp to read as if the millisecond
+        // clock had wrapped past `now`, simulating the mips32 `AtomicU32`
+        // rollover this fix targets.
+        {
+            let sessions = client.sessions.lock().await;
+            assert_eq!(sessions.len(), 1);
+            let wrapped = now_ms().wrapping_add(IDLE_TIMEOUT.as_millis() as Uint * 10);
+            sessions[0].last_used_ms.store(wrapped, Ordering::SeqCst);
+        }
+
+        // offer() runs its retain() pass on the next open: the wrapped
+        // session must still be recognized as idle-past-timeout and pruned,
+        // forcing a second dial.
+        let _s2 = client.open_stream("b.example", 81).await.unwrap();
+        assert_eq!(
+            dials.load(Ordering::SeqCst),
+            2,
+            "a session whose last-used stamp reads ahead of `now` (wrapped clock) \
+             must still be evicted as idle, not kept alive forever"
+        );
     }
 
     #[tokio::test]

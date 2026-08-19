@@ -2508,7 +2508,7 @@ mod tests {
         let pool_session = Arc::new(MuxSession {
             kind: SessionKind::MuxCool(Arc::clone(&session)),
             streams: std::sync::atomic::AtomicUsize::new(1),
-            last_used_ms: std::sync::atomic::AtomicU64::new(0),
+            last_used_ms: meow_common::atomic::AtomicU::new(0),
         });
         let parts = session
             .open_stream_parts("a.example", 80, true)
@@ -2587,7 +2587,7 @@ mod tests {
         let pool_session = Arc::new(MuxSession {
             kind: super::super::client::SessionKind::MuxCool(Arc::clone(&session)),
             streams: AtomicUsize::new(1),
-            last_used_ms: std::sync::atomic::AtomicU64::new(0),
+            last_used_ms: meow_common::atomic::AtomicU::new(0),
         });
         let parts = session
             .open_stream_parts("127.0.0.1", 18082, true)

@@ -257,8 +257,8 @@ mod tests {
     use super::super::client::{MuxStreamKind, SessionKind};
     use super::super::smux;
     use super::*;
+    use meow_common::atomic::AtomicU;
     use std::net::SocketAddr;
-    use std::sync::atomic::AtomicU64;
     use std::sync::atomic::AtomicUsize;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -333,7 +333,7 @@ mod tests {
         let session_arc = Arc::new(MuxSession {
             kind: SessionKind::Smux(session),
             streams: AtomicUsize::new(1),
-            last_used_ms: AtomicU64::new(0),
+            last_used_ms: AtomicU::new(0),
         });
         let conn = MuxPacketConn::new(
             stream,
@@ -416,7 +416,7 @@ mod tests {
         let session_arc = Arc::new(MuxSession {
             kind: SessionKind::Yamux(session),
             streams: AtomicUsize::new(1),
-            last_used_ms: AtomicU64::new(0),
+            last_used_ms: AtomicU::new(0),
         });
         let conn = MuxPacketConn::new(
             stream,
@@ -496,7 +496,7 @@ mod tests {
         let session_arc = Arc::new(MuxSession {
             kind: SessionKind::Smux(session),
             streams: AtomicUsize::new(1),
-            last_used_ms: AtomicU64::new(0),
+            last_used_ms: AtomicU::new(0),
         });
         let conn = Arc::new(MuxPacketConn::new(
             stream,
@@ -571,7 +571,7 @@ mod tests {
         let session_arc = Arc::new(MuxSession {
             kind: SessionKind::Smux(session),
             streams: AtomicUsize::new(1),
-            last_used_ms: AtomicU64::new(0),
+            last_used_ms: AtomicU::new(0),
         });
         let conn = MuxPacketConn::new(
             stream,
