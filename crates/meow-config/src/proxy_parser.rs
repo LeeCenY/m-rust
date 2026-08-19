@@ -1782,13 +1782,30 @@ fn parse_vless_reality_opts(
 
     // Subscription generators (e.g. Clash Verge) emit `short-id: null` when
     // the server has no short-id; mihomo treats it as absent (#388).
+    //
+    // An all-decimal short-id (e.g. `short-id: 1234`, unquoted) parses as a
+    // YAML integer rather than a string, so it must be reformatted back to
+    // its decimal digits before hex-decoding — otherwise the `as_str()` arm
+    // below rejects it and the node is silently dropped. This mirrors
+    // mihomo's weakly-typed decoder, which does the same int-to-decimal-string
+    // coercion (`common/structure`'s `decodeString`) before hex-decoding, so
+    // a subscription that yields a valid node on mihomo yields one here too
+    // (#408). Note this only round-trips cleanly when the short-id happens to
+    // be all decimal digits, e.g. `0x1f` parses as the number 31 and becomes
+    // `"31"`, not `"1f"` — the same lossy coercion mihomo performs.
     let short_id_str = match opts.get("short-id") {
-        None | Some(serde_yaml::Value::Null) => "",
+        None | Some(serde_yaml::Value::Null) => String::new(),
+        Some(serde_yaml::Value::Number(n)) => n
+            .as_u64()
+            .map(|u| u.to_string())
+            .or_else(|| n.as_i64().map(|i| i.to_string()))
+            .ok_or_else(|| "vless: reality-opts.short-id must be a hex string".to_string())?,
         Some(value) => value
             .as_str()
-            .ok_or_else(|| "vless: reality-opts.short-id must be a hex string".to_string())?,
+            .ok_or_else(|| "vless: reality-opts.short-id must be a hex string".to_string())?
+            .to_string(),
     };
-    let short_id_vec = parse_reality_short_id(short_id_str)?;
+    let short_id_vec = parse_reality_short_id(&short_id_str)?;
     let mut short_id = [0u8; 8];
     short_id[..short_id_vec.len()].copy_from_slice(&short_id_vec);
 

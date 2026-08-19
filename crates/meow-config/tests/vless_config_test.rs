@@ -457,6 +457,62 @@ proxies:
     );
 }
 
+/// An unquoted all-decimal `short-id` (e.g. `short-id: 1234`) parses as a
+/// YAML integer, not a string. mihomo's weakly-typed decoder coerces it back
+/// to its decimal digits before hex-decoding, so the identical subscription
+/// works there; without matching coercion the node is silently dropped (#408).
+#[tokio::test]
+async fn parse_vless_reality_opts_numeric_short_id_coerced_to_string() {
+    let yaml = r#"
+proxies:
+  - name: v
+    type: vless
+    server: example.com
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    tls: true
+    client-fingerprint: chrome
+    reality-opts:
+      public-key: AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE
+      short-id: 1234
+"#;
+    let config = load_config_from_str(yaml)
+        .await
+        .expect("REALITY VLESS config with unquoted numeric short-id must load");
+    assert!(
+        config.proxies.contains_key("v"),
+        "REALITY VLESS proxy with unquoted numeric short-id must be registered, not dropped"
+    );
+}
+
+/// `short-id: 0x1f` parses as the YAML integer 31 (not the hex string "1f").
+/// Pin the exact (lossy) coercion mihomo's decoder performs: the integer is
+/// reformatted to its decimal string ("31") and hex-decoded from there, same
+/// as a literal `short-id: "31"` would be.
+#[tokio::test]
+async fn parse_vless_reality_opts_hex_literal_short_id_decimal_coerced() {
+    let yaml = r#"
+proxies:
+  - name: v
+    type: vless
+    server: example.com
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    tls: true
+    client-fingerprint: chrome
+    reality-opts:
+      public-key: AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE
+      short-id: 0x1f
+"#;
+    let config = load_config_from_str(yaml)
+        .await
+        .expect("REALITY VLESS config with `0x1f` short-id must load");
+    assert!(
+        config.proxies.contains_key("v"),
+        "REALITY VLESS proxy with `short-id: 0x1f` must be registered, not dropped"
+    );
+}
+
 // ─── D10: tls: false + plain VLESS → warn once, loads ok ─────────────────────
 
 /// D10: `parse_vless_tls_false_plain_warns_once`
