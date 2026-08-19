@@ -41,9 +41,9 @@ anytls = ["dep:meow-anytls"]
 # Hysteria2 outbound implemented in-tree on top of Quinn.
 hysteria2 = ["dep:quinn", "dep:h3", "dep:h3-quinn", "dep:blake2"]
 # sing-mux connection multiplexing for VLESS/Trojan/Shadowsocks/VMess.
-# smux in this PR (tokio-util only); yamux/h2mux deps land in follow-up PRs.
+# smux + yamux in this PR; h2mux deps land in a follow-up PR.
 # Opt-out in `minimal` builds (ADR-0007 binary-size caps).
-mux = ["dep:tokio-util"]
+mux = ["dep:yamux", "dep:tokio-util"]
 # Native client for the `ech-tls-tunnel` SIP003 plugin
 # (https://github.com/shadowsocks/ech-tls-tunnel). Requires ECH on rustls,
 # which pulls aws-lc-rs in via meow-transport.
@@ -55,6 +55,7 @@ meow-dns = { workspace = true }
 meow-transport = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true, optional = true }
+yamux = { workspace = true, optional = true }
 meow-anytls = { workspace = true, optional = true }
 quinn = { workspace = true, optional = true }
 h3 = { workspace = true, optional = true }

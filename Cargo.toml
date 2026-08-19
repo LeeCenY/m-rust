@@ -194,6 +194,10 @@ socket2 = { version = "0.5", features = ["all"] }
 
 # Futures
 futures = "0.3"
+
+# Multiplexing (sing-mux yamux protocol; libp2p yamux is wire-compatible
+# with hashicorp/go-yamux used by sing-mux)
+yamux = "0.14"
 futures-util = "0.3"
 
 # WebSocket

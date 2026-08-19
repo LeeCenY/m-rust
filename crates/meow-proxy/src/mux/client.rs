@@ -9,6 +9,7 @@ use super::packet::MuxPacketConn;
 use super::request::Request;
 use super::smux;
 use super::stream::MuxStreamConn;
+use super::yamux;
 use super::{address, Protocol};
 use meow_common::{MeowError, Metadata, ProxyConn, ProxyPacketConn, Result};
 use std::collections::VecDeque;
@@ -73,6 +74,7 @@ fn now_ms() -> u64 {
 #[derive(Clone)]
 pub(crate) enum SessionKind {
     Smux(Arc<smux::Session>),
+    Yamux(Arc<yamux::Session>),
 }
 
 /// Write the sing-mux per-stream request prefix (flags + Socksaddr
@@ -111,12 +113,19 @@ impl SessionKind {
                 write_request_prefix(&mut stream, host, port, udp).await?;
                 Ok(stream)
             }
+            SessionKind::Yamux(session) => {
+                let mut stream =
+                    MuxStream::new(session.open_stream().await.map(MuxStreamKind::Yamux)?);
+                write_request_prefix(&mut stream, host, port, udp).await?;
+                Ok(stream)
+            }
         }
     }
 
     pub(crate) fn is_dead(&self) -> bool {
         match self {
             SessionKind::Smux(session) => session.is_dead(),
+            SessionKind::Yamux(session) => session.is_dead(),
         }
     }
 }
@@ -138,6 +147,7 @@ pub(crate) struct MuxStream {
 
 pub(crate) enum MuxStreamKind {
     Smux(smux::SmuxStream),
+    Yamux(yamux::Stream),
 }
 
 impl MuxStreamKind {
@@ -156,6 +166,7 @@ impl AsyncRead for MuxStreamKind {
     ) -> Poll<io::Result<()>> {
         match self.get_mut() {
             MuxStreamKind::Smux(stream) => Pin::new(stream).poll_read(cx, buf),
+            MuxStreamKind::Yamux(stream) => Pin::new(stream).poll_read(cx, buf),
         }
     }
 }
@@ -229,18 +240,21 @@ impl AsyncWrite for MuxStream {
     ) -> Poll<io::Result<usize>> {
         match &mut self.get_mut().kind {
             MuxStreamKind::Smux(stream) => Pin::new(stream).poll_write(cx, buf),
+            MuxStreamKind::Yamux(stream) => Pin::new(stream).poll_write(cx, buf),
         }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match &mut self.get_mut().kind {
             MuxStreamKind::Smux(stream) => Pin::new(stream).poll_flush(cx),
+            MuxStreamKind::Yamux(stream) => Pin::new(stream).poll_flush(cx),
         }
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match &mut self.get_mut().kind {
             MuxStreamKind::Smux(stream) => Pin::new(stream).poll_shutdown(cx),
+            MuxStreamKind::Yamux(stream) => Pin::new(stream).poll_shutdown(cx),
         }
     }
 }
@@ -512,6 +526,9 @@ impl MuxClient {
             Protocol::Smux => SessionKind::Smux(Arc::new(
                 smux::Session::client(conn).map_err(MeowError::Io)?,
             )),
+            Protocol::Yamux => SessionKind::Yamux(Arc::new(
+                yamux::Session::client(conn).map_err(MeowError::Io)?,
+            )),
         })
     }
 }
@@ -733,6 +750,19 @@ mod tests {
             }
             drop(streams);
         }
+    }
+
+    #[tokio::test]
+    async fn yamux_protocol_pools_streams() {
+        let dials = Arc::new(AtomicUsize::new(0));
+        let options = MuxOptions {
+            protocol: Protocol::Yamux,
+            ..MuxOptions::default()
+        };
+        let client = mock_mux_client_with(Arc::clone(&dials), options).await;
+        let _s1 = client.open_stream("a.example", 80).await.unwrap();
+        let _s2 = client.open_stream("b.example", 80).await.unwrap();
+        assert_eq!(dials.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

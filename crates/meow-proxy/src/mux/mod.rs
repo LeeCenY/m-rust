@@ -20,6 +20,7 @@ pub mod packet;
 pub mod request;
 pub mod smux;
 pub mod stream;
+pub mod yamux;
 
 pub use client::{DialFn, MuxClient, MuxOptions};
 pub use packet::MuxPacketConn;
@@ -31,17 +32,19 @@ pub const MUX_DESTINATION_PORT: u16 = 444;
 
 /// Mux protocol identifiers.
 ///
-/// `Smux` matches sing-mux's request-header byte value 0.  Yamux/H2Mux
-/// (bytes 1/2) and Xray Mux.Cool land in follow-up PRs.
+/// `Smux`/`Yamux` match sing-mux's request-header byte values 0/1.  H2Mux
+/// (byte 2) and Xray Mux.Cool land in follow-up PRs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Protocol {
     Smux = 0,
+    Yamux = 1,
 }
 
 impl Protocol {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "" | "smux" => Some(Protocol::Smux),
+            "yamux" => Some(Protocol::Yamux),
             _ => None,
         }
     }
