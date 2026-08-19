@@ -110,7 +110,12 @@ fn split_exclude_types(raw: Option<&[String]>) -> Vec<String> {
 
 enum Vehicle {
     File(PathBuf),
-    Http { url: String, cache_path: PathBuf },
+    Http {
+        url: String,
+        /// `None` = fetch to memory only (no containment root available for
+        /// an on-disk cache; issue #429).
+        cache_path: Option<PathBuf>,
+    },
 }
 
 impl ProxyProvider {
@@ -119,22 +124,25 @@ impl ProxyProvider {
         raw: &RawProxyProvider,
         cache_dir: Option<&Path>,
     ) -> Result<Self, String> {
+        // Any on-disk location (read or write) must stay inside `cache_dir`
+        // (issue #429): `path:` — and the provider *name* feeding the implicit
+        // cache location — are attacker-influenced when the config document
+        // does not come from a trusted on-disk file. Without a `cache_dir`
+        // there is no containment root, so no caller-named path is honoured.
         let (vehicle, vehicle_type) = match raw.provider_type.as_str() {
             "file" => {
                 let path_str = raw
                     .path
                     .as_deref()
                     .ok_or("file proxy-provider requires 'path'")?;
-                let path = if let Some(dir) = cache_dir {
-                    let p = Path::new(path_str);
-                    if p.is_absolute() {
-                        p.to_path_buf()
-                    } else {
-                        dir.join(p)
-                    }
-                } else {
-                    PathBuf::from(path_str)
+                let Some(dir) = cache_dir else {
+                    return Err(format!(
+                        "proxy-provider '{name}': 'path' cannot be used without a provider \
+                         cache directory"
+                    ));
                 };
+                let path = crate::safe_path::resolve_contained(dir, Path::new(path_str))
+                    .map_err(|e| format!("proxy-provider '{name}': {e}"))?;
                 (Vehicle::File(path), "File")
             }
             "http" => {
@@ -143,20 +151,27 @@ impl ProxyProvider {
                     .as_deref()
                     .ok_or("http proxy-provider requires 'url'")?
                     .to_string();
-                let cache_path = if let Some(p) = raw.path.as_deref() {
-                    if let Some(dir) = cache_dir {
-                        let pp = Path::new(p);
-                        if pp.is_absolute() {
-                            pp.to_path_buf()
-                        } else {
-                            dir.join(pp)
-                        }
-                    } else {
-                        PathBuf::from(p)
+                let cache_path = match (raw.path.as_deref(), cache_dir) {
+                    (Some(p), Some(dir)) => Some(
+                        crate::safe_path::resolve_contained(dir, Path::new(p))
+                            .map_err(|e| format!("proxy-provider '{name}': {e}"))?,
+                    ),
+                    (Some(_), None) => {
+                        warn!(
+                            provider = %name,
+                            "ignoring 'path' (no provider cache directory in this context); \
+                             fetching to memory without an on-disk cache"
+                        );
+                        None
                     }
-                } else {
-                    let dir = cache_dir.unwrap_or(Path::new("."));
-                    dir.join(format!("provider_{name}.yaml"))
+                    (None, Some(dir)) => Some(
+                        crate::safe_path::resolve_contained(
+                            dir,
+                            Path::new(&format!("provider_{name}.yaml")),
+                        )
+                        .map_err(|e| format!("proxy-provider '{name}': {e}"))?,
+                    ),
+                    (None, None) => None,
                 };
                 (Vehicle::Http { url, cache_path }, "HTTP")
             }
@@ -246,15 +261,17 @@ impl ProxyProvider {
                         match crate::internal_http::response_text_with_limit(resp).await {
                             Ok(text) => {
                                 // Cache to disk for offline fallback
-                                if let Some(parent) = cache_path.parent() {
-                                    let _ = tokio::fs::create_dir_all(parent).await;
+                                if let Some(cache_path) = cache_path {
+                                    if let Some(parent) = cache_path.parent() {
+                                        let _ = tokio::fs::create_dir_all(parent).await;
+                                    }
+                                    let _ = tokio::fs::write(cache_path, &text).await;
                                 }
-                                let _ = tokio::fs::write(cache_path, &text).await;
                                 Ok(text)
                             }
                             Err(e) => {
                                 warn!(provider = %self.name, error = %e, "HTTP body read failed, trying cache");
-                                read_cache(cache_path, &self.name).await
+                                read_cache(cache_path.as_deref(), &self.name).await
                             }
                         }
                     }
@@ -264,11 +281,11 @@ impl ProxyProvider {
                             status = %resp.status(),
                             "HTTP provider returned non-2xx, trying cache"
                         );
-                        read_cache(cache_path, &self.name).await
+                        read_cache(cache_path.as_deref(), &self.name).await
                     }
                     Err(e) => {
                         warn!(provider = %self.name, error = %e, "HTTP provider fetch failed, trying cache");
-                        read_cache(cache_path, &self.name).await
+                        read_cache(cache_path.as_deref(), &self.name).await
                     }
                 }
             }
@@ -415,7 +432,12 @@ fn compile_opt_regex(
     }
 }
 
-async fn read_cache(path: &Path, name: &str) -> Result<String, String> {
+async fn read_cache(path: Option<&Path>, name: &str) -> Result<String, String> {
+    let Some(path) = path else {
+        return Err(format!(
+            "proxy-provider '{name}': fetch failed and no on-disk cache is configured"
+        ));
+    };
     tokio::fs::read_to_string(path)
         .await
         .map_err(|e| format!("proxy-provider '{name}': no cache at {path:?}: {e}"))
@@ -459,11 +481,53 @@ mod tests {
 
     #[test]
     fn file_provider_new_succeeds() {
-        let raw = raw_file_provider("/tmp/proxies.yaml");
-        let p = ProxyProvider::new("test", &raw, None).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let raw = raw_file_provider("proxies.yaml");
+        let p = ProxyProvider::new("test", &raw, Some(dir.path())).unwrap();
         assert_eq!(p.name, "test");
         assert_eq!(p.vehicle_type, "File");
         assert!(p.header.is_empty());
+    }
+
+    #[test]
+    fn file_provider_requires_cache_dir_for_path() {
+        let raw = raw_file_provider("/tmp/proxies.yaml");
+        let Err(err) = ProxyProvider::new("test", &raw, None) else {
+            panic!("file path without a cache dir must fail");
+        };
+        assert!(err.contains("cache directory"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn file_provider_path_escaping_cache_dir_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        for path in ["../../etc/pwned", "/etc/pwned"] {
+            let raw = raw_file_provider(path);
+            let Err(err) = ProxyProvider::new("test", &raw, Some(dir.path())) else {
+                panic!("escaping path {path} must be rejected");
+            };
+            assert!(err.contains("escapes"), "path {path}: unexpected: {err}");
+        }
+    }
+
+    #[test]
+    fn http_provider_path_escaping_cache_dir_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = RawProxyProvider {
+            provider_type: "http".to_string(),
+            url: Some("http://127.0.0.1:1/proxies.yaml".to_string()),
+            path: Some("/etc/cron.d/pwned".to_string()),
+            interval: None,
+            filter: None,
+            exclude_filter: None,
+            exclude_type: None,
+            health_check: None,
+            header: None,
+        };
+        let Err(err) = ProxyProvider::new("test", &raw, Some(dir.path())) else {
+            panic!("escaping http cache path must be rejected");
+        };
+        assert!(err.contains("escapes"), "unexpected: {err}");
     }
 
     #[test]
@@ -506,10 +570,11 @@ header:
 
     #[test]
     fn raw_proxy_provider_no_header_defaults_empty() {
-        let yaml = "type: file\npath: /tmp/proxies.yaml\n";
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = "type: file\npath: proxies.yaml\n";
         let raw: RawProxyProvider = serde_yaml::from_str(yaml).unwrap();
         assert!(raw.header.is_none());
-        let p = ProxyProvider::new("p", &raw, None).unwrap();
+        let p = ProxyProvider::new("p", &raw, Some(dir.path())).unwrap();
         assert!(p.header.is_empty());
     }
 
@@ -549,7 +614,8 @@ header:
 
     async fn file_provider(path: &std::path::Path) -> ProxyProvider {
         let raw = raw_file_provider(path.to_str().unwrap());
-        let p = ProxyProvider::new("airport", &raw, None).unwrap();
+        let cache_dir = path.parent().expect("temp file has a parent dir");
+        let p = ProxyProvider::new("airport", &raw, Some(cache_dir)).unwrap();
         p.refresh().await.unwrap();
         p
     }

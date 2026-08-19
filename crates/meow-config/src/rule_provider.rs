@@ -206,7 +206,7 @@ fn read_payload_bytes(
 ) -> Result<Option<Vec<u8>>> {
     match cfg.provider_type.as_str() {
         "file" => {
-            let path = resolve_path(cfg, cache_dir, name)
+            let path = resolve_path(cfg, cache_dir, name)?
                 .ok_or_else(|| anyhow!("file provider '{name}' requires a 'path'"))?;
             let bytes = std::fs::read(&path)
                 .with_context(|| format!("reading provider file {}", path.display()))?;
@@ -217,7 +217,7 @@ fn read_payload_bytes(
                 .url
                 .as_deref()
                 .ok_or_else(|| anyhow!("http provider '{name}' requires a 'url'"))?;
-            let cache_path = resolve_path(cfg, cache_dir, name);
+            let cache_path = resolve_path(cfg, cache_dir, name)?;
             let prefer_cache = cfg.interval.unwrap_or(0) > 0;
             let bytes = fetch_http_blocking_with_cache(
                 url,
@@ -378,7 +378,7 @@ fn load_file(
              (Class B per ADR-0002)"
         );
     }
-    let path = resolve_path(cfg, cache_dir, name)
+    let path = resolve_path(cfg, cache_dir, name)?
         .ok_or_else(|| anyhow!("file provider '{name}' requires a 'path'"))?;
     let bytes = match prefetched {
         Some(b) => b.to_vec(),
@@ -412,7 +412,7 @@ fn load_http(
         .url
         .as_deref()
         .ok_or_else(|| anyhow!("http provider '{name}' requires a 'url'"))?;
-    let cache_path = resolve_path(cfg, cache_dir, name);
+    let cache_path = resolve_path(cfg, cache_dir, name)?;
     let explicit_format = parse_explicit_format(cfg)?;
     let interval = cfg.interval.unwrap_or(0);
     let bytes = match prefetched {
@@ -527,19 +527,64 @@ fn parse_text_payload(raw: &str) -> Vec<String> {
 // Path resolution
 // ---------------------------------------------------------------------------
 
-fn resolve_path(cfg: &RawRuleProvider, cache_dir: Option<&Path>, name: &str) -> Option<PathBuf> {
+/// Resolve the on-disk location of a provider's payload/cache, enforcing that
+/// it stays inside `cache_dir` (issue #429).
+///
+/// `path:` is attacker-influenced whenever the config arrives over the REST
+/// API (`PUT /configs`), and for http providers it is a **write** target, so:
+///
+/// - with a `cache_dir`, the resolved path (absolute or relative, `..` and
+///   symlinks included) must stay inside it — anything else is a hard error;
+/// - without a `cache_dir` (runtime rebuilds such as `PUT /configs` or
+///   `--config-string`) there is no containment root, so a `path:` is never
+///   honoured: http providers fall back to fetching into memory, file
+///   providers hard-error.
+fn resolve_path(
+    cfg: &RawRuleProvider,
+    cache_dir: Option<&Path>,
+    name: &str,
+) -> Result<Option<PathBuf>> {
     if let Some(p) = cfg.path.as_deref() {
-        let path = PathBuf::from(p);
-        if path.is_absolute() {
-            return Some(path);
-        }
-        return Some(match cache_dir {
-            Some(dir) => dir.join(path),
-            None => path,
-        });
+        let Some(dir) = cache_dir else {
+            if cfg.provider_type == "http" {
+                warn!(
+                    "rule-provider '{}': ignoring 'path' (no provider cache directory in this \
+                     context); fetching to memory without an on-disk cache",
+                    name
+                );
+                return Ok(None);
+            }
+            return Err(anyhow!(
+                "rule-provider '{name}': 'path' cannot be used without a provider cache directory"
+            ));
+        };
+        let path = crate::safe_path::resolve_contained(dir, Path::new(p))
+            .map_err(|e| anyhow!("rule-provider '{name}': {e}"))?;
+        return Ok(Some(path));
     }
-    let dir = cache_dir?;
-    Some(dir.join("rule-providers").join(format!("{name}.yaml")))
+    let Some(dir) = cache_dir else {
+        return Ok(None);
+    };
+    // The implicit location is derived from the provider *name* (a YAML map
+    // key, also attacker-influenced), so it gets the same containment check.
+    let implicit = Path::new("rule-providers").join(format!("{name}.yaml"));
+    let path = crate::safe_path::resolve_contained(dir, &implicit)
+        .map_err(|e| anyhow!("rule-provider '{name}': {e}"))?;
+    Ok(Some(path))
+}
+
+/// Validate every provider's payload/cache path up front, so a hostile config
+/// fails hard before any fetch or write happens (issue #429). Called by
+/// `rebuild_from_raw_impl` for every path into a (re)build: startup,
+/// `PUT`/`PATCH /configs`, and subscription refresh.
+pub(crate) fn validate_paths(
+    raw_providers: &HashMap<String, RawRuleProvider>,
+    cache_dir: Option<&Path>,
+) -> Result<()> {
+    for (name, cfg) in raw_providers {
+        resolve_path(cfg, cache_dir, name)?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -857,7 +902,7 @@ mod tests {
                 payload: None,
             },
         );
-        let out = load_providers(&providers, None, &ctx(), None);
+        let out = load_providers(&providers, Some(dir.path()), &ctx(), None);
         let p = out.get("mrs-test").expect("provider should load");
         assert_eq!(p.rule_count(), 2);
     }
@@ -882,7 +927,7 @@ mod tests {
                 payload: None,
             },
         );
-        let out = load_providers(&providers, None, &ctx(), None);
+        let out = load_providers(&providers, Some(dir.path()), &ctx(), None);
         assert_eq!(out.get("x").unwrap().rule_count(), 1);
     }
 
@@ -925,7 +970,7 @@ mod tests {
                 payload: None,
             },
         );
-        let out = load_providers(&providers, None, &ctx(), None);
+        let out = load_providers(&providers, Some(dir.path()), &ctx(), None);
         assert_eq!(out.len(), 1);
     }
 
@@ -1022,5 +1067,116 @@ mod tests {
         assert_eq!(ruleset_map.len(), 2);
         assert!(ruleset_map.contains_key("p1"));
         assert!(ruleset_map.contains_key("p2"));
+    }
+
+    // -- issue #429: provider paths must stay inside the cache dir ---------
+
+    #[test]
+    fn resolve_path_rejects_escaping_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        for p in ["../../etc/pwned", "/etc/cron.d/pwned", "a/../../b"] {
+            let mut cfg = http_cfg(None);
+            cfg.path = Some(p.to_string());
+            let err = resolve_path(&cfg, Some(dir.path()), "x")
+                .expect_err("escaping path must be rejected");
+            assert!(err.to_string().contains("escapes"), "path {p}: {err}");
+        }
+    }
+
+    #[test]
+    fn resolve_path_keeps_contained_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = http_cfg(None);
+        cfg.path = Some("sub/rules.yaml".to_string());
+        let got = resolve_path(&cfg, Some(dir.path()), "x").unwrap().unwrap();
+        assert!(got.starts_with(dir.path()), "unexpected: {}", got.display());
+
+        // Absolute paths are fine as long as they stay inside the cache dir.
+        cfg.path = Some(dir.path().join("rules.yaml").to_string_lossy().to_string());
+        assert!(resolve_path(&cfg, Some(dir.path()), "x").unwrap().is_some());
+    }
+
+    #[test]
+    fn file_provider_path_requires_cache_dir() {
+        let mut cfg = http_cfg(None);
+        cfg.provider_type = "file".to_string();
+        cfg.url = None;
+        cfg.path = Some("/etc/passwd".to_string());
+        let err = resolve_path(&cfg, None, "x").expect_err("file path without root must fail");
+        assert!(
+            err.to_string().contains("cache directory"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn implicit_path_from_hostile_provider_name_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = http_cfg(None); // no `path:` — implicit location from the name
+        let err = resolve_path(&cfg, Some(dir.path()), "../../evil")
+            .expect_err("traversal via provider name must be rejected");
+        assert!(err.to_string().contains("escapes"), "unexpected: {err}");
+    }
+
+    /// Regression test for issue #429: an http provider with a
+    /// caller-supplied `path:` and no cache directory (the `PUT /configs`
+    /// rebuild context) must fetch to memory and never write the path.
+    #[test]
+    fn http_provider_path_is_not_written_without_cache_dir() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return; // no fetch happened; the test still asserts no write
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("HTTP test listener failed: {e}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            let mut buf = [0_u8; 1024];
+            let _ = stream.read(&mut buf).unwrap();
+            let body = "payload:\n  - 'example.com'\n";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+
+        let victim_dir = tempfile::tempdir().unwrap();
+        let victim = victim_dir.path().join("outside").join("pwned");
+
+        let mut cfg = http_cfg(None);
+        cfg.url = Some(format!("http://{addr}/rules.yaml"));
+        cfg.path = Some(victim.to_string_lossy().to_string());
+        let mut providers = HashMap::new();
+        providers.insert("x".to_string(), cfg);
+
+        let out = load_providers(&providers, None, &ctx(), None);
+        server.join().unwrap();
+
+        // The provider still loads — payload fetched straight to memory…
+        let p = out.get("x").expect("provider must load to memory");
+        assert_eq!(p.rule_count(), 1);
+        // …but the caller-named path was never written, nor its parents created.
+        assert!(
+            !victim.exists(),
+            "attacker-controlled path was written: {}",
+            victim.display()
+        );
+        assert!(
+            !victim.parent().unwrap().exists(),
+            "parent of the attacker-controlled path was created"
+        );
     }
 }

@@ -966,10 +966,20 @@ async fn apply_raw_to_tunnel(
         .iter()
         .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
         .collect();
-    let (proxies, rules) =
-        rebuild_from_raw_with_resolver_async(raw, Arc::clone(state.tunnel.resolver()), providers)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    // Same provider-cache directory the daemon loaded its startup config
+    // with — this is a trusted rebuild of the daemon's own running config,
+    // not an untrusted candidate, so relative rule-provider paths must keep
+    // resolving instead of hard-failing with `cache_dir: None` (issue #429
+    // follow-up).
+    let cache_dir = meow_config::resource_cache_dir_for_config_path(&state.config_path);
+    let (proxies, rules) = rebuild_from_raw_with_resolver_async(
+        raw,
+        Arc::clone(state.tunnel.resolver()),
+        providers,
+        cache_dir,
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     if let Some(missing) = expected_groups
         .iter()
         .find(|name| !proxies.contains_key(name.as_str()))
@@ -997,9 +1007,10 @@ async fn rebuild_from_raw_with_resolver_async(
     raw: RawConfig,
     resolver: Arc<meow_dns::Resolver>,
     providers: HashMap<String, Arc<ProxyProvider>>,
+    cache_dir: std::path::PathBuf,
 ) -> Result<meow_config::RebuildResult, String> {
     tokio::task::spawn_blocking(move || {
-        meow_config::rebuild_from_raw_runtime(&raw, Some(resolver), &providers)
+        meow_config::rebuild_from_raw_runtime(&raw, Some(resolver), &providers, Some(&cache_dir))
     })
     .await
     .map_err(|e| format!("config rebuild task failed: {e}"))?
@@ -1828,24 +1839,29 @@ async fn put_configs(
         .iter()
         .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
         .collect();
-    let (proxies, rules) =
-        match rebuild_from_raw_with_resolver_async(raw_config.clone(), resolver, providers).await {
-            Ok(r) => r,
-            Err(e) => {
-                if force {
-                    tracing::error!("config reload forced despite validation error: {e}");
-                    (Default::default(), Vec::new())
-                } else {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(
-                            serde_json::json!({"message": format!("config validation error: {e}")}),
-                        ),
-                    )
-                        .into_response();
-                }
+    let cache_dir = meow_config::resource_cache_dir_for_config_path(&state.config_path);
+    let (proxies, rules) = match rebuild_from_raw_with_resolver_async(
+        raw_config.clone(),
+        resolver,
+        providers,
+        cache_dir,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            if force {
+                tracing::error!("config reload forced despite validation error: {e}");
+                (Default::default(), Vec::new())
+            } else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"message": format!("config validation error: {e}")})),
+                )
+                    .into_response();
             }
-        };
+        }
+    };
 
     // Cold reload: close all connections with structured log (Class A divergence from upstream)
     let stats = state.tunnel.statistics();

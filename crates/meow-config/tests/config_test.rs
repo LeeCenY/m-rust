@@ -942,7 +942,9 @@ async fn test_invalid_yaml() {
 
 #[tokio::test]
 async fn test_file_rule_provider_end_to_end() {
-    // Write a small domain list to a temp file.
+    // File rule-providers need a containment root for their `path:` (issue
+    // #429), so this goes through `load_config` with a real config file whose
+    // directory doubles as the provider root — the normal on-disk setup.
     let dir = tempfile::tempdir().unwrap();
     let list_path = dir.path().join("ads.yaml");
     std::fs::write(
@@ -951,23 +953,24 @@ async fn test_file_rule_provider_end_to_end() {
     )
     .unwrap();
 
-    let yaml = format!(
-        r#"
+    let yaml = r#"
 mixed-port: 7890
 rule-providers:
   ads:
     type: file
     behavior: domain
     format: yaml
-    path: {path}
+    path: ads.yaml
 rules:
   - RULE-SET,ads,REJECT
   - MATCH,DIRECT
-"#,
-        path = list_path.to_string_lossy()
-    );
+"#;
+    let config_path = dir.path().join("config.yaml");
+    std::fs::write(&config_path, yaml).unwrap();
 
-    let config = load_config_from_str(&yaml).await.unwrap();
+    let config = meow_config::load_config(config_path.to_str().unwrap())
+        .await
+        .unwrap();
     // RULE-SET rule + MATCH
     assert_eq!(config.rules.len(), 2);
     assert_eq!(config.rules[0].rule_type().to_string(), "RULE-SET");

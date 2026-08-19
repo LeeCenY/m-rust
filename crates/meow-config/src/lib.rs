@@ -15,6 +15,7 @@ pub mod proxy_provider;
 pub mod raw;
 pub mod rule_parser;
 pub mod rule_provider;
+mod safe_path;
 pub mod sub_rules_parser;
 pub mod subscription;
 
@@ -415,22 +416,42 @@ pub fn rebuild_from_raw(raw: &raw::RawConfig) -> Result<RebuildResult, anyhow::E
 
 /// Rebuild proxies/rules and inject `resolver` into the built-in DIRECT
 /// adapter so it avoids the OS resolver when dialing hostnames.
+///
+/// `cache_dir` should be the same provider-cache directory the config was
+/// originally loaded with (see [`resource_cache_dir_for_config_path`]) —
+/// this is a *trusted* rebuild of the daemon's own running config, not an
+/// untrusted candidate, so relative rule-provider `path`s must keep
+/// resolving the same way they did at startup instead of hard-failing
+/// (issue #429 follow-up).
 pub fn rebuild_from_raw_with_resolver(
     raw: &raw::RawConfig,
     resolver: Option<Arc<Resolver>>,
+    cache_dir: Option<&Path>,
 ) -> Result<RebuildResult, anyhow::Error> {
-    rebuild_from_raw_impl(raw, None, resolver, &HashMap::new(), None, None, None)
+    rebuild_from_raw_impl(raw, cache_dir, resolver, &HashMap::new(), None, None, None)
 }
 
 /// Runtime rebuild variant that keeps live proxy-provider slots and the
 /// process-wide selection store wired into rebuilt groups.
+///
+/// See [`rebuild_from_raw_with_resolver`] for why `cache_dir` must be the
+/// startup provider-cache directory rather than `None`.
 pub fn rebuild_from_raw_runtime(
     raw: &raw::RawConfig,
     resolver: Option<Arc<Resolver>>,
     providers: &HashMap<String, Arc<ProxyProvider>>,
+    cache_dir: Option<&Path>,
 ) -> Result<RebuildResult, anyhow::Error> {
     let store = meow_proxy::SelectorStore::global();
-    rebuild_from_raw_impl(raw, None, resolver, providers, store.as_ref(), None, None)
+    rebuild_from_raw_impl(
+        raw,
+        cache_dir,
+        resolver,
+        providers,
+        store.as_ref(),
+        None,
+        None,
+    )
 }
 
 /// Same as [`rebuild_from_raw`] but accepts a `cache_dir` used to resolve
@@ -666,6 +687,14 @@ fn rebuild_from_raw_impl(
     // Per-provider `proxy:` overrides resolve against the full registry —
     // groups and provider-sourced proxies included (issue #377).
     let registry_lookup = |name: &str| proxies.get(name).cloned();
+
+    // Fail hard on any rule-provider path that would escape the provider
+    // cache directory — before any fetch or on-disk write happens, so a
+    // hostile `PUT /configs` is rejected without touching the filesystem
+    // (issue #429).
+    if let Some(map) = raw.rule_providers.as_ref() {
+        rule_provider::validate_paths(map, cache_dir)?;
+    }
 
     // Fetch/read rule-provider payload bytes once — the parser-context build
     // scans them for geo keys (issue #277) and the provider load below parses
@@ -1384,7 +1413,16 @@ fn default_config_dir_without_home_override() -> PathBuf {
     base.join("meow")
 }
 
-fn resource_cache_dir_for_config_path(path: &str) -> PathBuf {
+/// Resolve the provider-cache directory for a config file path — the same
+/// directory [`load_config`] threads through as `cache_dir` at startup.
+///
+/// Trusted runtime rebuilds (subscription refresh, geodata rebuild, the
+/// config-mutating API endpoints) must recompute this from the daemon's own
+/// `config_path` and pass it back into [`rebuild_from_raw_with_resolver`] /
+/// [`rebuild_from_raw_runtime`] rather than passing `None`, or relative
+/// rule-provider `path`s that loaded fine at startup start hard-failing on
+/// every rebuild (issue #429 follow-up).
+pub fn resource_cache_dir_for_config_path(path: &str) -> PathBuf {
     resource_cache_dir_for_config_path_with_home(path, meow_common::meow_home_dir())
 }
 
@@ -2491,5 +2529,134 @@ mod async_guard_tests {
         use std::future::Future;
         use std::pin::Pin;
         let _fut: Pin<Box<dyn Future<Output = _>>> = Box::pin(super::load_config_from_str(""));
+    }
+}
+
+#[cfg(test)]
+mod provider_path_safety_tests {
+    //! Issue #429: rule-provider `path:` containment — a hostile config (e.g.
+    //! via `PUT /configs`) must fail validation before any fetch or write.
+    use super::*;
+
+    #[test]
+    fn rebuild_rejects_rule_provider_path_escaping_cache_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw: raw::RawConfig = serde_yaml::from_str(
+            r#"
+rule-providers:
+  x:
+    type: http
+    behavior: domain
+    format: yaml
+    url: "http://127.0.0.1:1/payload"
+    path: "/etc/cron.d/pwned"
+rules:
+  - "MATCH,DIRECT"
+"#,
+        )
+        .unwrap();
+        let Err(err) = rebuild_from_raw_with_cache_dir(&raw, Some(dir.path()), None) else {
+            panic!("escaping rule-provider path must fail the rebuild");
+        };
+        assert!(err.to_string().contains("escapes"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn rebuild_rejects_file_provider_path_without_cache_dir() {
+        // `rebuild_from_raw` is the genuinely rootless `cache_dir = None`
+        // path (FFI callers with no on-disk config, plain unit tests, …).
+        // Trusted daemon rebuilds — subscription refresh, geodata rebuild,
+        // and `PUT /configs` via `rebuild_from_raw_runtime` — always thread
+        // the real startup provider-cache dir through instead (issue #429
+        // follow-up), so they hit the `Some(cache_dir)` path below, not
+        // this one.
+        //
+        // Here there is no containment root at all, so a caller-named file
+        // path is a hard error.
+        let raw: raw::RawConfig = serde_yaml::from_str(
+            r#"
+rule-providers:
+  x:
+    type: file
+    behavior: domain
+    path: "/etc/passwd"
+rules:
+  - "MATCH,DIRECT"
+"#,
+        )
+        .unwrap();
+        let Err(err) = rebuild_from_raw(&raw) else {
+            panic!("file provider path without a cache dir must fail the rebuild");
+        };
+        assert!(
+            err.to_string().contains("cache directory"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn trusted_runtime_rebuilds_keep_working_with_a_file_rule_provider() {
+        // Regression for the PR #444 review finding: a config with a plain
+        // file rule-provider (the repo's own
+        // `test_file_rule_provider_end_to_end` shape) loads fine at startup
+        // and must keep rebuilding fine on every trusted runtime path —
+        // subscription refresh, geodata rebuild, and the `PUT /configs`
+        // family — once the real cache dir is threaded through instead of
+        // `None`.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("ads.yaml"),
+            "payload:\n  - '+.ads.example'\n",
+        )
+        .unwrap();
+        let raw: raw::RawConfig = serde_yaml::from_str(
+            r#"
+rule-providers:
+  ads:
+    type: file
+    behavior: domain
+    format: yaml
+    path: ads.yaml
+rules:
+  - RULE-SET,ads,REJECT
+  - "MATCH,DIRECT"
+"#,
+        )
+        .unwrap();
+
+        // `rebuild_from_raw_with_resolver` — used by subscription_refresh
+        // and geodata_fetch.
+        let (_, rules) = rebuild_from_raw_with_resolver(&raw, None, Some(dir.path())).expect(
+            "trusted rebuild with the real cache dir must not hard-fail on a file provider",
+        );
+        assert_eq!(rules.len(), 2);
+
+        // `rebuild_from_raw_runtime` — used by meow-api's `PUT /configs`
+        // family via `rebuild_from_raw_with_resolver_async`.
+        let (_, rules) = rebuild_from_raw_runtime(&raw, None, &HashMap::new(), Some(dir.path()))
+            .expect(
+            "trusted runtime rebuild with the real cache dir must not hard-fail on a file provider",
+        );
+        assert_eq!(rules.len(), 2);
+    }
+
+    #[test]
+    fn rebuild_rejects_traversal_in_rule_provider_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw: raw::RawConfig = serde_yaml::from_str(
+            r#"
+rule-providers:
+  x:
+    type: http
+    behavior: domain
+    url: "http://127.0.0.1:1/payload"
+    path: "../../outside.yaml"
+"#,
+        )
+        .unwrap();
+        let Err(err) = rebuild_from_raw_with_cache_dir(&raw, Some(dir.path()), None) else {
+            panic!("`..` traversal in rule-provider path must fail the rebuild");
+        };
+        assert!(err.to_string().contains("escapes"), "unexpected: {err}");
     }
 }
