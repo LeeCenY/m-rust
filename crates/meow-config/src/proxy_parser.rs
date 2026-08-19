@@ -140,6 +140,7 @@ pub fn parse_proxy(
                 plugin_opts_str.as_deref(),
             )
             .map_err(|e| format!("ss: {e}"))?;
+            // SS mux wiring lands in a follow-up PR (sing-mux for Shadowsocks).
             Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
         }
         #[cfg(feature = "trojan")]
@@ -163,7 +164,15 @@ pub fn parse_proxy(
                 .and_then(serde_yaml::Value::as_bool)
                 .unwrap_or(false);
 
-            let adapter = TrojanAdapter::new(name, server, port, password, sni, skip_verify, udp);
+            #[cfg_attr(not(feature = "mux"), allow(unused_mut))]
+            let mut adapter =
+                TrojanAdapter::new(name, server, port, password, sni, skip_verify, udp);
+            #[cfg(feature = "mux")]
+            if let Some(mux_options) = parse_mux_options(name, config)? {
+                adapter = adapter.with_mux(mux_options);
+            }
+            #[cfg(not(feature = "mux"))]
+            parse_mux_options(name, config)?;
             Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
         }
         #[cfg(feature = "vless")]
@@ -1066,7 +1075,7 @@ fn parse_lb_strategy(strategy: Option<&str>) -> std::result::Result<LbStrategy, 
 /// # Warn-once (Class B per ADR-0002)
 ///
 /// - `tls: false` with plain VLESS — plaintext, but correct destination
-/// - `mux: { enabled: true }` — Mux.Cool not implemented; warn and ignore
+/// - `mux: { enabled: true }` — sing-mux multiplexing (server must be sing-box/mihomo)
 /// - `flow: xtls-rprx-vision` + `udp: true` — Vision is TCP-only; UDP uses plain VLESS
 #[cfg(feature = "vless")]
 fn parse_vless(
@@ -1219,21 +1228,8 @@ fn parse_vless(
         );
     }
 
-    // ── Warn: mux enabled (Class B) ───────────────────────────────────────
-    if let Some(mux) = config.get("mux") {
-        let mux_enabled = mux
-            .get("enabled")
-            .and_then(serde_yaml::Value::as_bool)
-            .unwrap_or(false);
-        if mux_enabled {
-            tracing::warn!(
-                proxy = %name,
-                "vless: mux is not implemented (Mux.Cool); \
-                 the `mux` option is ignored. \
-                 (Class B divergence — upstream runs Mux.Cool)"
-            );
-        }
-    }
+    // ── mux: sing-mux compatible connection multiplexing ─────────────────
+    // Parsed after adapter construction below — see the `with_mux` call.
 
     // ── Warn: Vision + UDP (Class B) ─────────────────────────────────────
     if flow == Some(VlessFlow::XtlsRprxVision) && udp {
@@ -1428,7 +1424,230 @@ fn parse_vless(
     let mut adapter = VlessAdapter::new(name, server, port, uuid_bytes, flow, udp, chain);
     #[cfg(feature = "vless-encryption")]
     adapter.set_encryption(vless_encryption);
+
+    #[cfg(feature = "mux")]
+    if let Some(mux_options) = parse_mux_options(name, config)? {
+        // XTLS Vision + mux is rejected by both sing-box and Xray servers.
+        // Building a Vision-wrapped mux session gets the user a connection
+        // the server tears down with no diagnostic — hard error at config
+        // time rather than a silent dial failure.
+        #[cfg(feature = "vless-vision")]
+        if flow == Some(VlessFlow::XtlsRprxVision) {
+            return Err(
+                "vless: flow xtls-rprx-vision is incompatible with multiplexing \
+                 (sing-box and Xray reject XTLS + mux)"
+                    .into(),
+            );
+        }
+        adapter = adapter.with_mux(mux_options);
+    }
+    #[cfg(not(feature = "mux"))]
+    parse_mux_options(name, config)?;
+
     Ok(adapter)
+}
+
+/// Parse the optional mihomo `smux:` block shared by
+/// VLESS/Trojan/Shadowsocks/VMess.  `mux:` remains accepted as a legacy alias.
+///
+/// Two wire protocols are available, picked by `protocol`:
+///
+/// * sing-mux (smux/yamux/h2mux, default h2mux) — the first proxy request
+///   targets the reserved mux destination and streams carry a sing-encoded
+///   Socksaddr prefix.  Server must be sing-box / mihomo based.
+/// * muxcool — Xray's Mux.Cool (CommandMux 0x03 in the VLESS/VMess request
+///   header, frame mux).  Server must be Xray / sing-box based; VLESS and
+///   VMess support it (Trojan/Shadowsocks reject it).
+///
+/// Returns `None` when the block is absent or disabled; `Err` for
+/// malformed values.  Only compiled when one of its call sites
+/// (trojan / vless / ss / vmess parsing) exists.
+#[cfg(all(
+    feature = "mux",
+    any(
+        feature = "trojan",
+        feature = "vless",
+        feature = "ss",
+        feature = "vmess"
+    )
+))]
+fn parse_mux_options(
+    name: &str,
+    config: &HashMap<String, serde_yaml::Value>,
+) -> std::result::Result<Option<meow_proxy::mux::MuxOptions>, String> {
+    let Some(mux_cfg) = mux_config_block(name, config)? else {
+        return Ok(None);
+    };
+    let enabled = mux_bool_field(name, mux_cfg, "enabled", false)?;
+    if !enabled {
+        return Ok(None);
+    }
+    // Empty protocol maps to smux in this PR; h2mux (mihomo's default) lands
+    // in a follow-up PR.
+    let protocol_str = match mux_cfg.get("protocol") {
+        None => "smux",
+        Some(serde_yaml::Value::String(s)) => s.as_str(),
+        Some(other) => {
+            return Err(format!(
+                "{name}: mux option 'protocol' must be a string, got {other:?}"
+            ))
+        }
+    };
+    let Some(protocol) = meow_proxy::mux::Protocol::parse(protocol_str) else {
+        // mihomo hard-errors on unknown protocols; do the same so a typo
+        // cannot silently speak the wrong wire protocol to the server.
+        return Err(format!(
+            "{name}: unknown mux protocol '{protocol_str}'; valid value: smux (yamux/h2mux/muxcool land in follow-up PRs)"
+        ));
+    };
+    // max-connections=0 AND max-streams=0 means one physical connection
+    // per stream (mirrors mihomo/sing-mux exactly) — almost never what an
+    // operator wants, so say so.
+    let max_connections = mux_usize_field(name, mux_cfg, "max-connections", 4)?;
+    let max_streams = mux_usize_field(name, mux_cfg, "max-streams", 4)?;
+    if max_connections == 0 && max_streams == 0 {
+        tracing::warn!(
+            proxy = %name,
+            "mux: max-connections and max-streams are both 0 — every stream dials its own \
+             physical connection (mirrors mihomo); consider the 4/4/4 defaults"
+        );
+    }
+    // Parsed but unsupported upstream fields: `statistic` (per-connection
+    // traffic attribution in mihomo's dialer) and `brutal-opts` (TCP Brutal,
+    // Linux-only upstream).  Warn once so operators know the divergence.
+    for unsupported in ["statistic", "brutal-opts"] {
+        if mux_cfg.get(unsupported).is_some() {
+            tracing::warn!(
+                proxy = %name,
+                "mux option '{}' is not supported in meow-rs and will be ignored",
+                unsupported
+            );
+        }
+    }
+    Ok(Some(meow_proxy::mux::MuxOptions {
+        protocol,
+        padding: mux_bool_field(name, mux_cfg, "padding", false)?,
+        max_connections,
+        min_streams: mux_usize_field(name, mux_cfg, "min-streams", 4)?,
+        max_streams,
+        only_tcp: mux_bool_field(name, mux_cfg, "only-tcp", false)?,
+    }))
+}
+
+/// No-mux builds: warn loudly instead of silently ignoring an enabled
+/// `smux:`/`mux:` block (operators would otherwise think the node is multiplexed).
+/// Only compiled when one of its call sites (trojan / vless / ss / vmess
+/// parsing) exists.
+#[cfg(all(
+    not(feature = "mux"),
+    any(
+        feature = "trojan",
+        feature = "vless",
+        feature = "ss",
+        feature = "vmess"
+    )
+))]
+fn parse_mux_options(
+    name: &str,
+    config: &HashMap<String, serde_yaml::Value>,
+) -> std::result::Result<(), String> {
+    if let Some(mux_cfg) = mux_config_block(name, config)? {
+        let enabled = mux_cfg
+            .get("enabled")
+            .and_then(serde_yaml::Value::as_bool)
+            .unwrap_or(false);
+        if enabled {
+            tracing::warn!(
+                proxy = %name,
+                "mux is enabled in config but this build was compiled without the `mux` feature; the option is ignored"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(
+    feature = "trojan",
+    feature = "vless",
+    feature = "ss",
+    feature = "vmess"
+))]
+fn mux_config_block<'a>(
+    name: &str,
+    config: &'a HashMap<String, serde_yaml::Value>,
+) -> std::result::Result<Option<&'a serde_yaml::Value>, String> {
+    let block = match (config.get("smux"), config.get("mux")) {
+        (Some(_), Some(_)) => {
+            // Migration-friendly: prefer the canonical key and say so,
+            // instead of rejecting the node for a likely leftover.
+            tracing::warn!(
+                proxy = %name,
+                "both `smux` and legacy alias `mux` are configured; using the canonical `smux` key"
+            );
+            config.get("smux")
+        }
+        (Some(config), None) | (None, Some(config)) => Some(config),
+        (None, None) => None,
+    };
+    let Some(block) = block else {
+        return Ok(None);
+    };
+    // A scalar like `smux: true` must not be treated as "disabled" —
+    // the operator clearly tried to enable multiplexing.
+    if !block.is_mapping() {
+        return Err(format!(
+            "{name}: `smux`/`mux` must be a mapping, got {block:?}"
+        ));
+    }
+    Ok(Some(block))
+}
+
+#[cfg(all(
+    feature = "mux",
+    any(
+        feature = "trojan",
+        feature = "vless",
+        feature = "ss",
+        feature = "vmess"
+    )
+))]
+fn mux_bool_field(
+    name: &str,
+    mux_cfg: &serde_yaml::Value,
+    key: &str,
+    default: bool,
+) -> std::result::Result<bool, String> {
+    match mux_cfg.get(key) {
+        None => Ok(default),
+        Some(serde_yaml::Value::Bool(b)) => Ok(*b),
+        Some(other) => Err(format!(
+            "{name}: mux option '{key}' must be a boolean, got {other:?}"
+        )),
+    }
+}
+
+#[cfg(all(
+    feature = "mux",
+    any(
+        feature = "trojan",
+        feature = "vless",
+        feature = "ss",
+        feature = "vmess"
+    )
+))]
+fn mux_usize_field(
+    name: &str,
+    mux_cfg: &serde_yaml::Value,
+    key: &str,
+    default: usize,
+) -> std::result::Result<usize, String> {
+    match mux_cfg.get(key) {
+        None => Ok(default),
+        Some(serde_yaml::Value::Number(n)) if n.is_u64() => Ok(n.as_u64().unwrap() as usize),
+        Some(other) => Err(format!(
+            "{name}: mux option '{key}' must be a non-negative integer, got {other:?}"
+        )),
+    }
 }
 
 /// Parse the VLESS `encryption` field.
@@ -1708,20 +1927,6 @@ fn parse_vmess(
         .unwrap_or("tcp");
     let client_fingerprint = config.get("client-fingerprint").and_then(|v| v.as_str());
 
-    // Warn: mux enabled
-    if let Some(mux) = config.get("mux") {
-        if mux
-            .get("enabled")
-            .and_then(serde_yaml::Value::as_bool)
-            .unwrap_or(false)
-        {
-            tracing::warn!(
-                proxy = %name,
-                "vmess: mux is not implemented; the option is ignored"
-            );
-        }
-    }
-
     // Build transport chain (same pattern as VLESS)
     let mut chain = TransportChain::empty();
 
@@ -1782,9 +1987,11 @@ fn parse_vmess(
         }
     }
 
-    Ok(meow_proxy::VmessAdapter::new(
-        name, server, port, uuid_bytes, security, udp, chain,
-    ))
+    let adapter =
+        meow_proxy::VmessAdapter::new(name, server, port, uuid_bytes, security, udp, chain);
+    // VMess mux wiring lands in a follow-up PR (sing-mux + Mux.Cool for VMess).
+
+    Ok(adapter)
 }
 
 pub fn parse_proxy_group(

@@ -82,7 +82,7 @@ impl VlessConn {
     /// Like [`Self::new`], but defers the request header to the first
     /// write so a wrapping Vision layer can pad it together with the first
     /// payload (xray expects the request inside the first Vision record).
-    #[cfg(feature = "vless-vision")]
+    #[cfg(any(feature = "mux", feature = "vless-vision"))]
     pub async fn new_deferred(
         stream: Box<dyn Stream>,
         uuid_bytes: &[u8; 16],
@@ -626,7 +626,7 @@ mod tests {
         assert_eq!(&hdr[1..17], &TEST_UUID, "uuid must match");
     }
 
-    #[cfg(feature = "vless-vision")]
+    #[cfg(any(feature = "mux", feature = "vless-vision"))]
     #[tokio::test]
     async fn deferred_header_handles_one_byte_partial_writes() {
         let (client, mut server) = duplex(1024);
@@ -656,7 +656,7 @@ mod tests {
         assert_eq!(response, [b'!']);
     }
 
-    #[cfg(feature = "vless-vision")]
+    #[cfg(any(feature = "mux", feature = "vless-vision"))]
     #[tokio::test]
     async fn deferred_header_is_flushed_before_server_first_read() {
         let (client, mut server) = duplex(1024);

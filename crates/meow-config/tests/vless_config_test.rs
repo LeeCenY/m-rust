@@ -21,7 +21,7 @@
 //! | D13 | `parse_vless_vision_with_grpc_transport_ok`      — vision + grpc (TLS-enforcing) → ok |
 //! | D14 | `parse_vless_encryption_non_none_hard_errors`    — encryption: aes-128-gcm → hard error |
 //! | D15 | `parse_vless_encryption_empty_string_accepted`   — encryption: "" → ok |
-//! | D16 | `parse_vless_mux_enabled_warns_and_ignores`      — mux warns + loads |
+//! | D16 | `parse_vless_mux_enabled_loads_with_sing_mux`   — smux loads (h2mux default) |
 //! | D17 | `parse_vless_vision_udp_true_warns_once`         — vision + udp warns + loads |
 //! | D18 | `parse_vless_uuid_hex_and_dashed_both_accepted`  — both UUID forms ok |
 //! | D19 | `parse_vless_uuid_invalid_hard_errors`           — bad uuid → hard error |
@@ -687,16 +687,77 @@ proxies:
     );
 }
 
-// ─── D16: mux enabled → warn + ignores ───────────────────────────────────────
+// ─── D16: mux enabled → sing-mux attached ────────────────────────────────────
 
-/// D16: `parse_vless_mux_enabled_warns_and_ignores`
+/// D16: `parse_vless_mux_enabled_loads_with_sing_mux`
 ///
-/// `mux: { enabled: true }` → parse succeeds; at least one warn containing "mux".
-/// Class B per ADR-0002: Mux.Cool not implemented; same destination, no muxing.
-/// upstream: `adapter/outbound/vless.go` runs Mux.Cool.
-/// NOT hard-error — user gets a working (non-muxed) connection.
+/// `smux: { enabled: true }` → parse succeeds and the adapter is wired for
+/// sing-mux multiplexing (default protocol smux in this PR; h2mux lands later).  No mux
+/// warn is emitted — the feature is implemented.
+/// Interop note: server must be sing-box / mihomo based (Xray-only servers
+/// speak Mux.Cool, not this protocol).
+#[cfg(feature = "mux")]
 #[tokio::test]
-async fn parse_vless_mux_enabled_warns_and_ignores() {
+async fn parse_vless_mux_enabled_loads_with_sing_mux() {
+    let yaml = r#"
+proxies:
+  - name: v
+    type: vless
+    server: example.com
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    smux:
+      enabled: true
+"#;
+    let (result, lines) = with_warn_capture_async(load_config_from_str(yaml)).await;
+    result.expect("mux enabled must not be a hard error");
+    let mux_warns = lines
+        .iter()
+        .filter(|l| l.contains("WARN") && l.to_lowercase().contains("mux"))
+        .count();
+    assert_eq!(
+        mux_warns, 0,
+        "mux is implemented: no mux warn expected; captured lines: {lines:?}"
+    );
+}
+
+/// D16e: unknown mux protocol → proxy rejected with a loud warn (meow's
+/// warn+skip parse semantics; mihomo hard-errors on the same input).
+#[cfg(feature = "mux")]
+#[tokio::test]
+async fn parse_vless_mux_unknown_protocol_rejects_proxy() {
+    let yaml = r#"
+proxies:
+  - name: v
+    type: vless
+    server: example.com
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    mux:
+      enabled: true
+      protocol: not-a-protocol
+"#;
+    let (result, lines) = with_warn_capture_async(load_config_from_str(yaml)).await;
+    let config = result.expect("unknown mux protocol must not fail the whole config");
+    assert!(
+        !config.proxies.contains_key("v"),
+        "proxy with unknown mux protocol must be skipped"
+    );
+    let warns = lines
+        .iter()
+        .filter(|l| l.contains("unknown mux protocol"))
+        .count();
+    assert!(
+        warns >= 1,
+        "expected an unknown-mux-protocol warn; {lines:?}"
+    );
+}
+
+/// No-mux builds: an enabled `mux:` block must warn loudly instead of
+/// being silently ignored.
+#[cfg(not(feature = "mux"))]
+#[tokio::test]
+async fn parse_vless_mux_enabled_without_feature_warns() {
     let yaml = r#"
 proxies:
   - name: v
@@ -708,14 +769,100 @@ proxies:
       enabled: true
 "#;
     let (result, lines) = with_warn_capture_async(load_config_from_str(yaml)).await;
-    result.expect("mux enabled must not be a hard error");
-    let warn_count = lines
+    result.expect("mux config must still load without the feature");
+    let warns = lines
+        .iter()
+        .filter(|l| l.contains("compiled without the `mux` feature"))
+        .count();
+    assert!(warns >= 1, "expected a no-mux warn; {lines:?}");
+}
+
+/// D16f: `only-tcp: true` → accepted (UDP stays on the plain proxy path).
+#[cfg(feature = "mux")]
+#[tokio::test]
+async fn parse_vless_mux_only_tcp_accepted() {
+    let yaml = r#"
+proxies:
+  - name: v
+    type: vless
+    server: example.com
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    mux:
+      enabled: true
+      only-tcp: true
+"#;
+    let (result, lines) = with_warn_capture_async(load_config_from_str(yaml)).await;
+    result.expect("only-tcp mux must load");
+    let mux_warns = lines
         .iter()
         .filter(|l| l.contains("WARN") && l.to_lowercase().contains("mux"))
         .count();
+    assert_eq!(mux_warns, 0, "no warn expected; captured lines: {lines:?}");
+}
+
+/// D16g: `statistic` / `brutal-opts` → accepted with a warn each
+/// (upstream fields meow-rs does not implement).
+#[cfg(feature = "mux")]
+#[tokio::test]
+async fn parse_vless_mux_unsupported_fields_warn_and_ignore() {
+    let yaml = r#"
+proxies:
+  - name: v
+    type: vless
+    server: example.com
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    mux:
+      enabled: true
+      statistic: true
+      brutal-opts:
+        enabled: true
+        up: 100
+        down: 100
+"#;
+    let (result, lines) = with_warn_capture_async(load_config_from_str(yaml)).await;
+    result.expect("unsupported mux fields must not be a hard error");
+    // The config may be parsed more than once during load; assert each
+    // unsupported field warned at least once.
+    let statistic = lines
+        .iter()
+        .filter(|l| l.contains("mux option 'statistic'"))
+        .count();
+    let brutal = lines
+        .iter()
+        .filter(|l| l.contains("mux option 'brutal-opts'"))
+        .count();
     assert!(
-        warn_count >= 1,
-        "at least one WARN about mux must be emitted; captured lines: {lines:?}"
+        statistic >= 1 && brutal >= 1,
+        "expected one warn per unsupported field; {lines:?}"
+    );
+}
+
+/// D16c: explicit `protocol: yamux` → accepted without warn.
+/// D16d: `mux: { enabled: false }` → plain VLESS, no mux, no warn.
+#[cfg(feature = "mux")]
+#[tokio::test]
+async fn parse_vless_mux_disabled_loads_plain() {
+    let yaml = r#"
+proxies:
+  - name: v
+    type: vless
+    server: example.com
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    mux:
+      enabled: false
+"#;
+    let (result, lines) = with_warn_capture_async(load_config_from_str(yaml)).await;
+    result.expect("mux disabled must load");
+    let mux_warns = lines
+        .iter()
+        .filter(|l| l.contains("WARN") && l.to_lowercase().contains("mux"))
+        .count();
+    assert_eq!(
+        mux_warns, 0,
+        "no mux warn expected; captured lines: {lines:?}"
     );
 }
 
