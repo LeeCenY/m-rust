@@ -136,7 +136,12 @@ impl Store for MemoryStore {
     fn del_by_ip(&self, ip: IpAddr) {
         let mut inner = self.inner.lock();
         if let Some(host) = inner.by_ip.pop(&ip) {
-            inner.by_host.pop(&host);
+            // Compare-and-delete: only drop the forward entry while it still
+            // points at `ip`. A stale reverse entry (host since remapped to a
+            // different address) must not destroy the host's live mapping.
+            if inner.by_host.peek(&host) == Some(&ip) {
+                inner.by_host.pop(&host);
+            }
         }
     }
     fn exists(&self, ip: IpAddr) -> bool {
@@ -364,7 +369,10 @@ impl Store for FileStore {
         let host = self.reverse.lock().remove(&ip);
         if let Some(host) = host {
             let mut s = self.state.lock();
-            s.entries.remove(host.as_str());
+            // Compare-and-delete — see `MemoryStore::del_by_ip`.
+            if s.entries.get(host.as_str()) == Some(&ip) {
+                s.entries.remove(host.as_str());
+            }
             drop(s);
             self.mark_dirty();
         }
@@ -472,10 +480,18 @@ impl Pool {
     /// any work — callers may pass mixed-case.
     pub fn lookup(&self, host: &str) -> IpAddr {
         let host = host.to_ascii_lowercase();
+        // Hold the pool mutex across BOTH the store read and the allocation
+        // (mirrors upstream Go mihomo, whose `Pool.Lookup` holds `p.mux`
+        // across the store read and `p.get()`). A check-then-act gap here
+        // lets two concurrent lookups for the same unmapped host both miss
+        // and both allocate — burning two pool addresses and, once the
+        // cursor later wraps onto the orphaned first address, destroying
+        // the host's live forward mapping via `del_by_ip` (issue #434).
+        let mut inner = self.inner.lock();
         if let Some(existing) = self.store.get_by_host(&host) {
             return existing;
         }
-        self.allocate(&host)
+        self.allocate(&mut inner, &host)
     }
 
     /// Reverse lookup: host that `ip` was allocated to, if any. Excludes
@@ -525,8 +541,11 @@ impl Pool {
         }
     }
 
-    fn allocate(&self, host: &str) -> IpAddr {
-        let mut inner = self.inner.lock();
+    /// Allocate the next cursor address for `host`. The caller must hold the
+    /// pool mutex (`self.inner`) and pass the guard's contents in — taking
+    /// the lock here, after `lookup`'s store read released it, is exactly
+    /// the race window of issue #434.
+    fn allocate(&self, inner: &mut PoolInner, host: &str) -> IpAddr {
         // Advance cursor.
         let mut candidate = next_addr(inner.offset);
         if !addr_less(candidate, self.last) {
@@ -790,6 +809,75 @@ mod tests {
         let a = pool.lookup("Example.COM");
         let b = pool.lookup("example.com");
         assert_eq!(a, b, "lookup must lowercase before keying");
+    }
+
+    #[test]
+    fn concurrent_lookup_same_host_allocates_once() {
+        // Issue #434: two workers racing on the same unmapped host must not
+        // both allocate. With the store read and the allocation serialised
+        // under the pool mutex, every thread gets the same IP and exactly
+        // one pool address is consumed.
+        let pool = Arc::new(make_pool_v4());
+        #[allow(
+            clippy::needless_collect,
+            reason = "the intermediate Vec is load-bearing: all threads must be \
+                      spawned before any is joined, or the lookups run serially"
+        )]
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let pool = Arc::clone(&pool);
+                std::thread::spawn(move || pool.lookup("x.example"))
+            })
+            .collect();
+        let ips: Vec<IpAddr> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert!(
+            ips.iter().all(|ip| *ip == ips[0]),
+            "all concurrent lookups must return one IP, got {ips:?}"
+        );
+        assert_eq!(ips[0], IpAddr::from_str("198.18.0.4").unwrap());
+        // Cursor advanced by exactly one: the next host gets the next slot,
+        // proving no orphaned second allocation was burned.
+        assert_eq!(
+            pool.lookup("y.example"),
+            IpAddr::from_str("198.18.0.5").unwrap()
+        );
+    }
+
+    #[test]
+    fn memory_store_del_by_ip_spares_remapped_host() {
+        let s = MemoryStore::new(16);
+        let ip1 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let ip2 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+        s.put("h.example", ip1);
+        s.put("h.example", ip2); // ip1's reverse entry is now stale
+        s.del_by_ip(ip1);
+        assert!(s.get_by_ip(ip1).is_none(), "stale reverse entry removed");
+        assert_eq!(
+            s.get_by_host("h.example"),
+            Some(ip2),
+            "evicting a stale reverse entry must not delete the live forward mapping"
+        );
+        // Deleting the live pair still removes both directions.
+        s.del_by_ip(ip2);
+        assert!(s.get_by_host("h.example").is_none());
+        assert!(s.get_by_ip(ip2).is_none());
+    }
+
+    #[tokio::test]
+    async fn file_store_del_by_ip_spares_remapped_host() {
+        let tmp = tempdir();
+        let path = tmp.join("fakeip-del.json");
+        let s = FileStore::open(&path).unwrap();
+        let ip1 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let ip2 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+        s.put("h.example", ip1);
+        s.put("h.example", ip2);
+        s.del_by_ip(ip1);
+        assert!(s.get_by_ip(ip1).is_none());
+        assert_eq!(s.get_by_host("h.example"), Some(ip2));
+        s.del_by_ip(ip2);
+        assert!(s.get_by_host("h.example").is_none());
+        let _ = fs::remove_file(&path);
     }
 
     #[test]
