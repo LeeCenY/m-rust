@@ -971,7 +971,8 @@ async fn run(
                         config.listeners.routing_mark,
                         nl.name.clone(),
                     )
-                    .with_sniffer(Arc::clone(&sniffer_runtime));
+                    .with_sniffer(Arc::clone(&sniffer_runtime))
+                    .with_max_connections(nl.max_connections);
                     tokio::spawn(async move {
                         if let Err(e) = listener.run_on(socket).await {
                             error!("TProxy listener error: {}", e);

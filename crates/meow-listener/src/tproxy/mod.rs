@@ -7,10 +7,19 @@ use meow_common::{ConnType, Metadata, Network};
 use meow_tunnel::{copy_bidirectional_buf_tracked, ConnectionGuard, Tunnel, RELAY_BUF_SIZE};
 use smallvec::smallvec;
 use std::collections::HashSet;
+use std::future::Future;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
+
+/// Default cap on in-flight inbound connections per listener when the
+/// listener config doesn't set `max-connections` (mirrors
+/// `mixed::DEFAULT_MAX_CONNECTIONS` — kept as a separate constant rather than
+/// an import so `listener-tproxy` stays usable without `listener-mixed`
+/// enabled). `0` explicitly disables the cap.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 256;
 
 pub struct TProxyListener {
     tunnel: Tunnel,
@@ -18,6 +27,7 @@ pub struct TProxyListener {
     sniffer: Option<Arc<SnifferRuntime>>,
     routing_mark: Option<u32>,
     name: String,
+    max_connections: usize,
 }
 
 impl TProxyListener {
@@ -51,6 +61,7 @@ impl TProxyListener {
             sniffer,
             routing_mark,
             name,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
         }
     }
 
@@ -58,6 +69,13 @@ impl TProxyListener {
         if sniffer.is_enabled() {
             self.sniffer = Some(sniffer);
         }
+        self
+    }
+
+    /// Override the cap on in-flight inbound connections (default
+    /// [`DEFAULT_MAX_CONNECTIONS`]). `0` disables the cap.
+    pub fn with_max_connections(mut self, max: usize) -> Self {
+        self.max_connections = max;
         self
     }
 
@@ -84,7 +102,17 @@ impl TProxyListener {
         // Set up firewall redirect rules (tears down on drop)
         let _firewall = FirewallGuard::setup(bound_addr.port(), self.routing_mark, &bypass_ips)?;
 
-        info!("TProxy listener '{}' started on {}", self.name, bound_addr);
+        if self.max_connections == 0 {
+            info!(
+                "TProxy listener '{}' started on {} (max_connections=unlimited)",
+                self.name, bound_addr
+            );
+        } else {
+            info!(
+                "TProxy listener '{}' started on {} (max_connections={})",
+                self.name, bound_addr, self.max_connections
+            );
+        }
 
         // Scope decision for the pf path (#248): the managed ruleset
         // intercepts loopback-traversing IPv4 TCP only; steering real
@@ -99,21 +127,97 @@ impl TProxyListener {
              for full transparent proxying use the TUN inbound (docs/tun.md)"
         );
 
-        loop {
-            let (stream, src_addr) = listener.accept().await?;
-            let tunnel = self.tunnel.clone();
-            let listen_addr = bound_addr;
-            let sniffer = self.sniffer.clone();
-            let name = self.name.clone();
-
-            tokio::spawn(async move {
-                if let Err(e) =
-                    handle_tproxy_conn(tunnel, stream, src_addr, listen_addr, sniffer, name).await
-                {
-                    debug!("TProxy connection error from {src_addr}: {e}");
+        let tunnel = self.tunnel;
+        let sniffer = self.sniffer;
+        let name = self.name;
+        let max_connections = self.max_connections;
+        bounded_accept_loop(listener, max_connections, name.clone(), {
+            move |stream, src_addr| {
+                let tunnel = tunnel.clone();
+                let sniffer = sniffer.clone();
+                let name = name.clone();
+                async move {
+                    if let Err(e) =
+                        handle_tproxy_conn(tunnel, stream, src_addr, bound_addr, sniffer, name)
+                            .await
+                    {
+                        debug!("TProxy connection error from {src_addr}: {e}");
+                    }
                 }
-            });
-        }
+            }
+        })
+        .await
+    }
+}
+
+/// Accept loop bounded by an optional `max_connections` semaphore: a permit
+/// is acquired *before* `accept()` (back-pressuring the TCP listen queue
+/// instead of spawning unboundedly and bloating RSS — issue #435) and
+/// released once `handle`'s future completes. `max_connections == 0`
+/// disables the cap.
+///
+/// Extracted as a free function generic over the per-connection handler so
+/// the concurrency-cap invariant can be pinned by a unit test (see `tests`
+/// below) without needing a live firewall/redirect setup, which
+/// [`TProxyListener::run_on`] requires before reaching this loop.
+async fn bounded_accept_loop<F, Fut>(
+    listener: TcpListener,
+    max_connections: usize,
+    name: String,
+    mut handle: F,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    F: FnMut(TcpStream, SocketAddr) -> Fut,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let conn_limit: Option<Arc<Semaphore>> = if max_connections > 0 {
+        Some(Arc::new(Semaphore::new(max_connections)))
+    } else {
+        None
+    };
+    let mut warned_saturated = false;
+
+    loop {
+        let permit = if let Some(sem) = &conn_limit {
+            let sem = Arc::clone(sem);
+            if sem.available_permits() == 0 && !warned_saturated {
+                warn!(
+                    "TProxy listener '{}' saturated at {} concurrent connections; new clients will queue",
+                    name, max_connections
+                );
+                warned_saturated = true;
+            }
+            match sem.acquire_owned().await {
+                Ok(p) => {
+                    if warned_saturated {
+                        debug!("TProxy listener '{}' has free capacity again", name);
+                        warned_saturated = false;
+                    }
+                    Some(p)
+                }
+                Err(_) => return Ok(()), // semaphore closed → shutdown
+            }
+        } else {
+            None
+        };
+
+        // Log-and-continue on accept errors (matching mixed.rs) rather than
+        // propagating: a transient EMFILE/ECONNABORTED must not tear down
+        // `run_on`'s `_firewall` guard and take the redirect rules with it.
+        let (stream, src_addr) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                debug!("TProxy listener '{}' accept error: {e}", name);
+                drop(permit);
+                continue;
+            }
+        };
+
+        let fut = handle(stream, src_addr);
+        tokio::spawn(async move {
+            fut.await;
+            drop(permit);
+        });
     }
 }
 
@@ -274,4 +378,122 @@ async fn handle_tproxy_conn(
     }
     // _guard drops here, removing the entry from Statistics.
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    use tokio::sync::{mpsc, Notify};
+
+    /// Regression test for issue #435: a `max_connections: N` cap must never
+    /// let more than `N` handler futures run concurrently, even when far more
+    /// than `N` clients connect at once.
+    ///
+    /// The handler blocks on a shared `Notify` until told to proceed, so the
+    /// test can deterministically observe the in-flight count saturate at
+    /// exactly `N` (rather than racing against real work durations).
+    #[tokio::test]
+    async fn accept_loop_never_exceeds_max_connections() {
+        const CAP: usize = 3;
+        const CLIENTS: usize = 10;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_observed = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(Notify::new());
+        // Signalled once `CAP` handlers are simultaneously in flight, so the
+        // driver knows saturation was actually reached before releasing them.
+        let saturated = Arc::new(Notify::new());
+
+        let in_flight_h = Arc::clone(&in_flight);
+        let max_observed_h = Arc::clone(&max_observed);
+        let release_h = Arc::clone(&release);
+        let saturated_h = Arc::clone(&saturated);
+
+        let loop_task = tokio::spawn(async move {
+            bounded_accept_loop(
+                listener,
+                CAP,
+                "test-tproxy".to_string(),
+                move |stream, _src| {
+                    let in_flight = Arc::clone(&in_flight_h);
+                    let max_observed = Arc::clone(&max_observed_h);
+                    let release = Arc::clone(&release_h);
+                    let saturated = Arc::clone(&saturated_h);
+                    async move {
+                        drop(stream);
+                        let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                        max_observed.fetch_max(now, Ordering::SeqCst);
+                        if now == CAP {
+                            saturated.notify_one();
+                        }
+                        release.notified().await;
+                        in_flight.fetch_sub(1, Ordering::SeqCst);
+                    }
+                },
+            )
+            .await
+        });
+
+        // Dial all clients up front; only CAP permits exist, so at most CAP
+        // handlers can be in flight no matter how many connections arrive.
+        let (done_tx, mut done_rx) = mpsc::channel::<()>(CLIENTS);
+        for _ in 0..CLIENTS {
+            let done_tx = done_tx.clone();
+            tokio::spawn(async move {
+                let _ = TcpStream::connect(addr).await;
+                let _ = done_tx.send(()).await;
+            });
+        }
+        drop(done_tx);
+
+        // Wait until the cap is actually saturated before asserting on it.
+        tokio::time::timeout(Duration::from_secs(5), saturated.notified())
+            .await
+            .expect("cap was never saturated");
+        assert_eq!(
+            in_flight.load(Ordering::SeqCst),
+            CAP,
+            "in-flight count should sit exactly at the cap once saturated"
+        );
+
+        // Release handlers one at a time; the in-flight count must never
+        // exceed CAP as the remaining queued clients get admitted.
+        for _ in 0..CLIENTS {
+            release.notify_one();
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            assert!(
+                in_flight.load(Ordering::SeqCst) <= CAP,
+                "in-flight count exceeded the configured cap"
+            );
+        }
+
+        // Drain remaining client-side completions (best-effort; some may
+        // have failed to dial if the OS backlog was briefly full).
+        let _ = tokio::time::timeout(Duration::from_secs(5), async {
+            for _ in 0..CLIENTS {
+                done_rx.recv().await;
+            }
+        })
+        .await;
+
+        loop_task.abort();
+        assert_eq!(
+            max_observed.load(Ordering::SeqCst),
+            CAP,
+            "cap should have been reached but never exceeded"
+        );
+    }
+
+    #[test]
+    fn default_max_connections_matches_mixed_listener_default() {
+        // Kept as separate constants (see DEFAULT_MAX_CONNECTIONS doc comment)
+        // but they must stay numerically in sync with the config default of
+        // 256 (`meow_config`'s `raw.max_connections.unwrap_or(256)`).
+        assert_eq!(DEFAULT_MAX_CONNECTIONS, 256);
+    }
 }
