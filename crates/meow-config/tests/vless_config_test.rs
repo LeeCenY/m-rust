@@ -808,6 +808,76 @@ proxies:
     assert_eq!(mux_warns, 0, "muxcool is implemented: no warn expected");
 }
 
+/// D16f2 (issue #424): `flow: xtls-rprx-vision` + `protocol: muxcool` on
+/// VLESS → accepted. Xray's own Mux.Cool signaling rides inside the VLESS
+/// request that Vision splices, and this combination is live-tested against
+/// a real Xray node (docs/specs/proxy-mux.md "Test Plan" items 2-3); only
+/// the sing-mux protocols (smux/yamux/h2mux) are incompatible with Vision.
+#[cfg(all(feature = "mux", feature = "vless-vision"))]
+#[tokio::test]
+async fn parse_vless_vision_muxcool_accepted() {
+    let yaml = r#"
+proxies:
+  - name: v
+    type: vless
+    server: example.com
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    tls: true
+    flow: "xtls-rprx-vision"
+    mux:
+      enabled: true
+      protocol: muxcool
+"#;
+    let (result, lines) = with_warn_capture_async(load_config_from_str(yaml)).await;
+    let config = result.expect("vision + muxcool must load (issue #424)");
+    assert!(
+        config.proxies.contains_key("v"),
+        "vision + muxcool proxy must be kept"
+    );
+    let mux_warns = lines
+        .iter()
+        .filter(|l| l.contains("WARN") && l.to_lowercase().contains("mux"))
+        .count();
+    assert_eq!(
+        mux_warns, 0,
+        "vision + muxcool is implemented: no warn expected; captured lines: {lines:?}"
+    );
+}
+
+/// D16f3 (issue #424): `flow: xtls-rprx-vision` + a sing-mux protocol
+/// (default h2mux) on VLESS → hard error. sing-box and Xray both reject
+/// XTLS + sing-mux; this remains gated even though `protocol: muxcool` is
+/// now accepted above.
+#[cfg(all(feature = "mux", feature = "vless-vision"))]
+#[tokio::test]
+async fn parse_vless_vision_singmux_rejected() {
+    let yaml = r#"
+proxies:
+  - name: v
+    type: vless
+    server: example.com
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    tls: true
+    flow: "xtls-rprx-vision"
+    mux:
+      enabled: true
+"#;
+    let (result, lines) = with_warn_capture_async(load_config_from_str(yaml)).await;
+    let config = result.expect("invalid proxy must not fail the whole config");
+    assert!(
+        !config.proxies.contains_key("v"),
+        "vision + sing-mux (h2mux default) node must be skipped"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("incompatible with sing-mux")),
+        "expected a sing-mux incompatibility warn; {lines:?}"
+    );
+}
+
 /// D16g: `protocol: muxcool` on Trojan → rejected (VLESS/VMess-only protocol;
 /// trojan's CommandMux is smux, not Mux.Cool frames).
 #[cfg(all(feature = "mux", feature = "trojan"))]
