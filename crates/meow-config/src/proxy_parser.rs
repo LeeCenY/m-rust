@@ -1095,6 +1095,8 @@ fn parse_lb_strategy(strategy: Option<&str>) -> std::result::Result<LbStrategy, 
 /// - `uuid` invalid
 /// - `server` domain > 255 bytes
 /// - `vless-vision` feature absent + `flow: xtls-rprx-vision`
+/// - `flow: xtls-rprx-vision` + `smux`/`mux` protocol `smux`/`yamux`/`h2mux`
+///   — sing-box and Xray reject XTLS + sing-mux (`protocol: muxcool` is fine)
 ///
 /// # Warn-once (Class B per ADR-0002)
 ///
@@ -1451,15 +1453,24 @@ fn parse_vless(
 
     #[cfg(feature = "mux")]
     if let Some(mux_options) = parse_mux_options(name, config)? {
-        // XTLS Vision + mux is rejected by both sing-box and Xray servers.
-        // Building a Vision-wrapped mux session gets the user a connection
-        // the server tears down with no diagnostic — hard error at config
-        // time rather than a silent dial failure.
+        // Vision + sing-mux (smux/yamux/h2mux) is rejected by both sing-box
+        // and Xray servers: the mux session dials the reserved mux
+        // destination and the server tears the Vision-wrapped connection
+        // down with no diagnostic — hard error at config time rather than a
+        // silent dial failure. Vision + Mux.Cool (`protocol: muxcool`) is
+        // the opposite case: Xray's own Mux.Cool signaling rides inside the
+        // VLESS request that Vision splices, and this has been live-tested
+        // against a real Xray node (see docs/specs/proxy-mux.md "Test Plan"
+        // items 2-3, issue #424) — so only the sing-mux protocols are gated
+        // here.
         #[cfg(feature = "vless-vision")]
-        if flow == Some(VlessFlow::XtlsRprxVision) {
+        if flow == Some(VlessFlow::XtlsRprxVision)
+            && mux_options.protocol != meow_proxy::mux::Protocol::MuxCool
+        {
             return Err(
-                "vless: flow xtls-rprx-vision is incompatible with multiplexing \
-                 (sing-box and Xray reject XTLS + mux)"
+                "vless: flow xtls-rprx-vision is incompatible with sing-mux \
+                 (smux/yamux/h2mux); sing-box and Xray reject XTLS + sing-mux. \
+                 Use `protocol: muxcool` for Vision + multiplexing instead."
                     .into(),
             );
         }
