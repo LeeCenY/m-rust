@@ -12,16 +12,22 @@
 //! | D3 | `h2_single_host_no_randomness_needed` — single host, 10 conns, no panic |
 //! | D4 | `h2_path_forwarded`               — `:path` pseudo-header matches config |
 //! | D5 | `h2_round_trip_with_deferred_response` — server withholds response HEADERS until the first client DATA frame (issue #377) |
+//! | D6 | `h2_pending_write_retried_with_same_buffer_keeps_parking` — a parked write retried with the same remainder keeps parking |
+//! | D7 | `h2_pending_write_retried_with_changed_buffer_is_rejected` — a parked write retried with different bytes is rejected, not sent stale |
 
 mod support;
 
+use std::future::poll_fn;
+use std::pin::Pin;
+use std::task::Poll;
 use std::time::Duration;
 
 use meow_transport::h2::{H2Config, H2Layer};
+use meow_transport::h2_common::{H2Stream, RecvState};
 use meow_transport::Transport;
 use meow_transport::TransportError;
 use support::loopback::{spawn_h2_server, spawn_h2_server_deferred_response};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 async fn assert_h2_config_error(config: H2Config, expected: &str) {
     let (client, _server) = tokio::io::duplex(64);
@@ -273,5 +279,125 @@ async fn h2_round_trip_with_deferred_response() {
     assert_eq!(
         &got, b"ping",
         "round-trip bytes must survive the deferred response"
+    );
+}
+
+// ─── D6/D7: write-cancellation contract on the shared H2 stream ──────────────
+
+/// Payload larger than h2's default 65535-byte send window, so the write
+/// cannot complete in one poll however the peer's SETTINGS race the first
+/// `poll_write`.
+const STALLED_PAYLOAD_LEN: usize = 128 * 1024;
+
+/// Open one client stream against a server that accepts the request and then
+/// stops driving its connection: the request body is never read, so the
+/// client's send window is never replenished and the write parks with the
+/// payload stashed in the stream's `pending_write`.
+async fn stalled_h2_stream() -> (H2Stream, tokio::task::JoinHandle<()>) {
+    let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+
+    let server = tokio::spawn(async move {
+        let mut connection = h2::server::Builder::new()
+            .handshake::<_, bytes::Bytes>(server_io)
+            .await
+            .expect("server handshake");
+        let _accepted = connection.accept().await;
+        // Never polled again: no WINDOW_UPDATE is ever sent back.
+        std::future::pending::<()>().await;
+    });
+
+    let (send_request, connection) = h2::client::handshake(client_io)
+        .await
+        .expect("client handshake");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let request = http::Request::builder()
+        .method(http::Method::POST)
+        .uri("https://localhost")
+        .body(())
+        .expect("static request");
+    let mut send_request = send_request.ready().await.expect("send_request ready");
+    let (response, send_stream) = send_request
+        .send_request(request, false)
+        .expect("send_request");
+
+    (H2Stream::new(send_stream, RecvState::new(response)), server)
+}
+
+/// Drive `poll_write` until the send window is exhausted; returns how many
+/// bytes of `payload` the peer accepted before the write parked.
+async fn write_until_pending(stream: &mut H2Stream, payload: &[u8]) -> usize {
+    let mut sent = 0usize;
+    loop {
+        let progress = poll_fn(|cx| {
+            Poll::Ready(
+                match Pin::new(&mut *stream).poll_write(cx, &payload[sent..]) {
+                    Poll::Pending => None,
+                    Poll::Ready(Ok(n)) => Some(n),
+                    Poll::Ready(Err(e)) => panic!("unexpected write error: {e}"),
+                },
+            )
+        })
+        .await;
+        match progress {
+            Some(n) => {
+                sent += n;
+                assert!(
+                    sent < payload.len(),
+                    "the peer accepted the whole payload; the write never parked"
+                );
+            }
+            None => return sent,
+        }
+    }
+}
+
+/// D6: retrying a parked write with the same remainder is the contract-
+/// abiding case and must keep parking, not trip the changed-buffer guard.
+#[tokio::test]
+async fn h2_pending_write_retried_with_same_buffer_keeps_parking() {
+    let (mut stream, _server) = stalled_h2_stream().await;
+    let payload = vec![b'a'; STALLED_PAYLOAD_LEN];
+    let sent = write_until_pending(&mut stream, &payload).await;
+
+    for _ in 0..3 {
+        let polled = poll_fn(|cx| {
+            Poll::Ready(
+                match Pin::new(&mut stream).poll_write(cx, &payload[sent..]) {
+                    Poll::Pending => None,
+                    other => Some(other),
+                },
+            )
+        })
+        .await;
+        assert!(
+            polled.is_none(),
+            "same-buffer retry must stay Pending, got {polled:?}"
+        );
+    }
+}
+
+/// D7: a parked write retried with *different* bytes must be rejected.
+/// Sending the stashed payload under the new buffer's reported length would
+/// put stale bytes on the wire and silently drop the caller's (issue seen in
+/// the mux stack, cf. #407).
+#[tokio::test]
+async fn h2_pending_write_retried_with_changed_buffer_is_rejected() {
+    let (mut stream, _server) = stalled_h2_stream().await;
+    let payload = vec![b'a'; STALLED_PAYLOAD_LEN];
+    let sent = write_until_pending(&mut stream, &payload).await;
+
+    // Same length as the stashed remainder: the guard must compare content,
+    // not just size.
+    let decoy = vec![b'b'; STALLED_PAYLOAD_LEN - sent];
+    let error = poll_fn(|cx| Pin::new(&mut stream).poll_write(cx, &decoy))
+        .await
+        .expect_err("a changed buffer must be rejected");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(
+        error.to_string().contains("write buffer changed"),
+        "unexpected error: {error}"
     );
 }
