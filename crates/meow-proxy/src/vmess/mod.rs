@@ -54,10 +54,17 @@ impl VmessAdapter {
         }
     }
 
-    /// Enable sing-mux compatible connection multiplexing (smux in this PR;
-    /// yamux/h2mux land in follow-up PRs). The session's VMess request targets
-    /// the reserved mux destination (sp.mux.sing-box.arpa:444); the server must
-    /// be sing-box / mihomo with multiplex enabled on the VMess inbound.
+    /// Enable connection multiplexing.  Two wire protocols share one
+    /// connection pool (protocol picked by the `protocol` mux option):
+    ///
+    /// * sing-mux (smux/yamux/h2mux) — the session's VMess request targets
+    ///   the reserved mux destination (sp.mux.sing-box.arpa:444) and a mux
+    ///   request header follows; server must be sing-box / mihomo with
+    ///   multiplex enabled on the VMess inbound.
+    /// * muxcool — the session's VMess request itself is the signaling
+    ///   (CommandMux 0x03, no address); server must be Xray, or sing-box /
+    ///   mihomo (sing-vmess routes CommandMux to HandleMuxConnection, no
+    ///   inbound config needed).
     #[cfg(feature = "mux")]
     pub fn with_mux(mut self, options: crate::mux::MuxOptions) -> Self {
         use crate::mux::{MuxClient, MUX_DESTINATION_FQDN, MUX_DESTINATION_PORT};
@@ -68,18 +75,26 @@ impl VmessAdapter {
         let cmd_key = self.cmd_key;
         let security = self.security;
         let port = self.port;
+        let protocol = options.protocol;
 
         let dial: crate::mux::DialFn = StdArc::new(move || {
             let transport = Arc::clone(&transport);
             let server = server.clone();
             Box::pin(async move {
-                let metadata = Metadata {
-                    host: MUX_DESTINATION_FQDN.into(),
-                    dst_port: MUX_DESTINATION_PORT,
-                    ..Default::default()
-                };
-                let sealed = header::seal_request_header(&cmd_key, security, &metadata, false)
-                    .map_err(MeowError::Proxy)?;
+                let sealed = match protocol {
+                    crate::mux::Protocol::MuxCool => {
+                        header::seal_mux_request_header(&cmd_key, security)
+                    }
+                    _ => {
+                        let metadata = Metadata {
+                            host: MUX_DESTINATION_FQDN.into(),
+                            dst_port: MUX_DESTINATION_PORT,
+                            ..Default::default()
+                        };
+                        header::seal_request_header(&cmd_key, security, &metadata, false)
+                    }
+                }
+                .map_err(MeowError::Proxy)?;
                 dial_vmess(&transport, &server, port, sealed, security).await
             })
         });

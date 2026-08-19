@@ -325,7 +325,6 @@ mod tests {
         assert_eq!(&buf[..n], b"hello-udp");
         assert_eq!(src, "127.0.0.1:53".parse::<SocketAddr>().unwrap());
     }
-
     /// UDP round trip over a yamux session (parity with the smux test;
     /// the review flagged yamux UDP as untested).
     #[tokio::test]

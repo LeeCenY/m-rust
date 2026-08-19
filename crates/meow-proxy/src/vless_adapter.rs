@@ -100,14 +100,17 @@ impl VlessAdapter {
         }
     }
 
-    /// Enable connection multiplexing.  sing-mux (smux in this PR; yamux/h2mux
-    /// land in follow-up PRs) shares one connection pool: the session's VLESS
-    /// request targets the reserved mux destination
-    /// (sp.mux.sing-box.arpa:444) and a mux request header follows; the server
-    /// must be sing-box / mihomo with multiplex enabled.
+    /// Enable connection multiplexing.  Two wire protocols share one
+    /// connection pool (protocol picked by the `protocol` mux option):
+    ///
+    /// * sing-mux (smux/yamux/h2mux) — the session's VLESS request targets
+    ///   the reserved mux destination (sp.mux.sing-box.arpa:444) and a mux
+    ///   request header follows; server must be sing-box / mihomo.
+    /// * muxcool — the session's VLESS request itself is the signaling
+    ///   (CommandMux 0x03, no address); server must be Xray / sing-box.
     #[cfg(feature = "mux")]
     pub fn with_mux(mut self, options: MuxOptions) -> Self {
-        use crate::mux::{MuxClient, MUX_DESTINATION_FQDN, MUX_DESTINATION_PORT};
+        use crate::mux::{MuxClient, Protocol, MUX_DESTINATION_FQDN, MUX_DESTINATION_PORT};
         use crate::vless::header::VlessAddr;
         use std::sync::Arc as StdArc;
 
@@ -116,6 +119,7 @@ impl VlessAdapter {
         let uuid_bytes = self.uuid_bytes;
         let transport = StdArc::clone(&self.transport);
         let flow = self.flow;
+        let protocol = options.protocol;
         #[cfg(feature = "vless-encryption")]
         let encryption = self.encryption.clone();
 
@@ -139,35 +143,57 @@ impl VlessAdapter {
                     Some(VlessFlow::XtlsRprxVision) => Some("xtls-rprx-vision"),
                     _ => None,
                 };
-                let addr = VlessAddr::domain(MUX_DESTINATION_FQDN).expect("static mux fqdn");
-                #[cfg(feature = "vless-vision")]
-                // Defense-in-depth: parse_vless rejects vision+mux at config
-                // time; this guards programmatic construction.  Match on
-                // flow_str (which is Some only for the Vision variant) rather
-                // than flow.is_some(), so a future second flow variant does
-                // not silently build a VisionConn.
-                if flow_str.is_some() {
-                    let vless = VlessConn::new_deferred(
-                        stream,
-                        &uuid_bytes,
-                        flow_str,
-                        Cmd::Tcp,
-                        MUX_DESTINATION_PORT,
-                        &addr,
-                    )
-                    .await?;
-                    return Ok(Box::new(VisionConn::new(vless, uuid_bytes)) as Box<dyn ProxyConn>);
+                match protocol {
+                    Protocol::MuxCool => {
+                        // Vision wraps before the header: the first mux
+                        // frame (a stream's New frame) carries the VLESS
+                        // CommandMux request inside the same Vision record.
+                        #[cfg(feature = "vless-vision")]
+                        if flow_str.is_some() {
+                            let vless =
+                                VlessConn::new_mux_deferred(stream, &uuid_bytes, flow_str).await?;
+                            return Ok(
+                                Box::new(VisionConn::new(vless, uuid_bytes)) as Box<dyn ProxyConn>
+                            );
+                        }
+                        let conn = VlessConn::new_mux(stream, &uuid_bytes, flow_str).await?;
+                        Ok(Box::new(StreamConn(Box::new(conn))) as Box<dyn ProxyConn>)
+                    }
+                    Protocol::Smux | Protocol::Yamux | Protocol::H2Mux => {
+                        let addr =
+                            VlessAddr::domain(MUX_DESTINATION_FQDN).expect("static mux fqdn");
+                        #[cfg(feature = "vless-vision")]
+                        // Defense-in-depth: parse_vless rejects vision+mux at
+                        // config time; this guards programmatic construction.
+                        // Match on flow_str (Some only for the Vision variant)
+                        // rather than flow.is_some(), so a future second flow
+                        // variant does not silently build a VisionConn.
+                        if flow_str.is_some() {
+                            let vless = VlessConn::new_deferred(
+                                stream,
+                                &uuid_bytes,
+                                flow_str,
+                                Cmd::Tcp,
+                                MUX_DESTINATION_PORT,
+                                &addr,
+                            )
+                            .await?;
+                            return Ok(
+                                Box::new(VisionConn::new(vless, uuid_bytes)) as Box<dyn ProxyConn>
+                            );
+                        }
+                        let conn = VlessConn::new(
+                            stream,
+                            &uuid_bytes,
+                            flow_str,
+                            Cmd::Tcp,
+                            MUX_DESTINATION_PORT,
+                            &addr,
+                        )
+                        .await?;
+                        Ok(Box::new(StreamConn(Box::new(conn))) as Box<dyn ProxyConn>)
+                    }
                 }
-                let conn = VlessConn::new(
-                    stream,
-                    &uuid_bytes,
-                    flow_str,
-                    Cmd::Tcp,
-                    MUX_DESTINATION_PORT,
-                    &addr,
-                )
-                .await?;
-                Ok(Box::new(StreamConn(Box::new(conn))) as Box<dyn ProxyConn>)
             })
         });
         self.mux = Some(MuxClient::new(dial, options));

@@ -143,6 +143,15 @@ pub fn parse_proxy(
             .map_err(|e| format!("ss: {e}"))?;
             #[cfg(feature = "mux")]
             if let Some(mux_options) = parse_mux_options(name, config)? {
+                // muxcool rides VLESS CommandMux; shadowsocks has no
+                // equivalent signaling — reject loudly instead of speaking
+                // garbage frames to the server.
+                if mux_options.protocol == meow_proxy::mux::Protocol::MuxCool {
+                    return Err(format!(
+                        "{name}: mux protocol 'muxcool' is VLESS/VMess-only; \
+                         use smux/yamux/h2mux for shadowsocks nodes"
+                    ));
+                }
                 adapter = adapter.with_mux(mux_options);
             }
             #[cfg(not(feature = "mux"))]
@@ -175,6 +184,15 @@ pub fn parse_proxy(
                 TrojanAdapter::new(name, server, port, password, sni, skip_verify, udp);
             #[cfg(feature = "mux")]
             if let Some(mux_options) = parse_mux_options(name, config)? {
+                // muxcool rides VLESS CommandMux; trojan has no equivalent
+                // signaling (its CommandMux=0x7f is smux) — reject loudly
+                // instead of speaking garbage frames to the server.
+                if mux_options.protocol == meow_proxy::mux::Protocol::MuxCool {
+                    return Err(format!(
+                        "{name}: mux protocol 'muxcool' is VLESS/VMess-only; \
+                         use smux/yamux/h2mux for trojan nodes"
+                    ));
+                }
                 adapter = adapter.with_mux(mux_options);
             }
             #[cfg(not(feature = "mux"))]
@@ -1502,7 +1520,7 @@ fn parse_mux_options(
         // mihomo hard-errors on unknown protocols; do the same so a typo
         // cannot silently speak the wrong wire protocol to the server.
         return Err(format!(
-            "{name}: unknown mux protocol '{protocol_str}'; valid values: smux, yamux, h2mux (muxcool lands in a follow-up PR)"
+            "{name}: unknown mux protocol '{protocol_str}'; valid values: smux, yamux, h2mux, muxcool"
         ));
     };
     // max-connections=0 AND max-streams=0 means one physical connection

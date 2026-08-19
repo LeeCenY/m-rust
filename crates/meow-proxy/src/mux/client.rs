@@ -6,6 +6,7 @@
 //! the configured connection/stream bounds are reached.
 
 use super::h2mux;
+use super::muxcool;
 use super::packet::MuxPacketConn;
 use super::request::Request;
 use super::smux;
@@ -76,6 +77,7 @@ pub(crate) enum SessionKind {
     Smux(Arc<smux::Session>),
     Yamux(Arc<yamux::Session>),
     H2Mux(Arc<h2mux::Session>),
+    MuxCool(Arc<muxcool::MuxCoolSession>),
 }
 
 /// Write the sing-mux per-stream request prefix (flags + Socksaddr
@@ -126,6 +128,11 @@ impl SessionKind {
                 write_request_prefix(&mut stream, host, port, udp).await?;
                 Ok(stream)
             }
+            SessionKind::MuxCool(session) => session
+                .open_stream(host, port, udp)
+                .await
+                .map(MuxStreamKind::MuxCool)
+                .map(MuxStream::new),
         }
     }
 
@@ -134,6 +141,7 @@ impl SessionKind {
             SessionKind::Smux(session) => session.is_dead(),
             SessionKind::Yamux(session) => session.is_dead(),
             SessionKind::H2Mux(session) => session.is_dead(),
+            SessionKind::MuxCool(session) => session.unavailable(),
         }
     }
 }
@@ -157,13 +165,14 @@ pub(crate) enum MuxStreamKind {
     Smux(smux::SmuxStream),
     Yamux(yamux::Stream),
     H2Mux(h2mux::Stream),
+    MuxCool(muxcool::Stream),
 }
 
 impl MuxStreamKind {
     /// sing-mux prefixes every stream with a response status byte;
-    /// every protocol in this PR is sing-mux, so all streams require it.
+    /// Mux.Cool has no per-stream preamble (server Keep frames are data).
     fn requires_response(&self) -> bool {
-        true
+        !matches!(self, MuxStreamKind::MuxCool(_))
     }
 }
 
@@ -177,6 +186,7 @@ impl AsyncRead for MuxStreamKind {
             MuxStreamKind::Smux(stream) => Pin::new(stream).poll_read(cx, buf),
             MuxStreamKind::Yamux(stream) => Pin::new(stream).poll_read(cx, buf),
             MuxStreamKind::H2Mux(stream) => Pin::new(stream).poll_read(cx, buf),
+            MuxStreamKind::MuxCool(stream) => Pin::new(stream).poll_read(cx, buf),
         }
     }
 }
@@ -252,6 +262,7 @@ impl AsyncWrite for MuxStream {
             MuxStreamKind::Smux(stream) => Pin::new(stream).poll_write(cx, buf),
             MuxStreamKind::Yamux(stream) => Pin::new(stream).poll_write(cx, buf),
             MuxStreamKind::H2Mux(stream) => Pin::new(stream).poll_write(cx, buf),
+            MuxStreamKind::MuxCool(stream) => Pin::new(stream).poll_write(cx, buf),
         }
     }
 
@@ -260,6 +271,7 @@ impl AsyncWrite for MuxStream {
             MuxStreamKind::Smux(stream) => Pin::new(stream).poll_flush(cx),
             MuxStreamKind::Yamux(stream) => Pin::new(stream).poll_flush(cx),
             MuxStreamKind::H2Mux(stream) => Pin::new(stream).poll_flush(cx),
+            MuxStreamKind::MuxCool(stream) => Pin::new(stream).poll_flush(cx),
         }
     }
 
@@ -268,6 +280,7 @@ impl AsyncWrite for MuxStream {
             MuxStreamKind::Smux(stream) => Pin::new(stream).poll_shutdown(cx),
             MuxStreamKind::Yamux(stream) => Pin::new(stream).poll_shutdown(cx),
             MuxStreamKind::H2Mux(stream) => Pin::new(stream).poll_shutdown(cx),
+            MuxStreamKind::MuxCool(stream) => Pin::new(stream).poll_shutdown(cx),
         }
     }
 }
@@ -380,12 +393,21 @@ impl MuxClient {
             || "0.0.0.0:0".parse().expect("static placeholder"),
             |ip| SocketAddr::new(ip, port),
         );
-        let kind = stream.kind;
-        Ok(Box::new(MuxPacketConn::new(
-            MuxStream::new(kind),
-            session,
-            destination,
-        )))
+        match stream.kind {
+            MuxStreamKind::MuxCool(stream) => {
+                let muxcool::Stream { parts, .. } = stream;
+                Ok(Box::new(muxcool::PacketConn::new(
+                    parts,
+                    session,
+                    destination,
+                )))
+            }
+            kind => Ok(Box::new(MuxPacketConn::new(
+                MuxStream::new(kind),
+                session,
+                destination,
+            ))),
+        }
     }
 
     /// Open a stream (writing its per-stream request: sing-mux prefix or
@@ -527,25 +549,35 @@ impl MuxClient {
 
     async fn create_session(&self) -> Result<SessionKind> {
         let mut conn = (self.dial)().await?;
-        let header = Request::new(
-            if self.options.padding { 1 } else { 0 },
-            self.options.protocol as u8,
-            self.options.padding,
-        )
-        .encode();
-        conn.write_all(&header).await.map_err(MeowError::Io)?;
-        conn.flush().await.map_err(MeowError::Io)?;
-        Ok(match self.options.protocol {
-            Protocol::Smux => SessionKind::Smux(Arc::new(
-                smux::Session::client(conn).map_err(MeowError::Io)?,
+        match self.options.protocol {
+            Protocol::Smux | Protocol::Yamux | Protocol::H2Mux => {
+                let header = Request::new(
+                    if self.options.padding { 1 } else { 0 },
+                    self.options.protocol as u8,
+                    self.options.padding,
+                )
+                .encode();
+                conn.write_all(&header).await.map_err(MeowError::Io)?;
+                conn.flush().await.map_err(MeowError::Io)?;
+                Ok(match self.options.protocol {
+                    Protocol::Smux => SessionKind::Smux(Arc::new(
+                        smux::Session::client(conn).map_err(MeowError::Io)?,
+                    )),
+                    Protocol::Yamux => SessionKind::Yamux(Arc::new(
+                        yamux::Session::client(conn).map_err(MeowError::Io)?,
+                    )),
+                    Protocol::H2Mux => SessionKind::H2Mux(Arc::new(
+                        h2mux::Session::client(conn).await.map_err(MeowError::Io)?,
+                    )),
+                    Protocol::MuxCool => unreachable!("handled above"),
+                })
+            }
+            Protocol::MuxCool => Ok(SessionKind::MuxCool(
+                muxcool::MuxCoolSession::client(conn)
+                    .await
+                    .map_err(MeowError::Io)?,
             )),
-            Protocol::Yamux => SessionKind::Yamux(Arc::new(
-                yamux::Session::client(conn).map_err(MeowError::Io)?,
-            )),
-            Protocol::H2Mux => SessionKind::H2Mux(Arc::new(
-                h2mux::Session::client(conn).await.map_err(MeowError::Io)?,
-            )),
-        })
+        }
     }
 }
 
