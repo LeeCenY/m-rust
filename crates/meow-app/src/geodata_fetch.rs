@@ -98,6 +98,7 @@ pub async fn run_on_startup(
     tunnel: Tunnel,
     raw_config: Arc<RwLock<RawConfig>>,
     resolver: Arc<Resolver>,
+    cache_dir: PathBuf,
 ) {
     let targets = compute_targets(&geo);
 
@@ -116,7 +117,14 @@ pub async fn run_on_startup(
     let raw = raw_config.read().clone();
     let rebuild = tokio::task::spawn_blocking({
         let resolver = Arc::clone(&resolver);
-        move || meow_config::rebuild_from_raw_with_resolver(&raw, Some(resolver))
+        let cache_dir = cache_dir.clone();
+        move || {
+            meow_config::rebuild_from_raw_with_resolver(
+                &raw,
+                Some(resolver),
+                Some(cache_dir.as_path()),
+            )
+        }
     })
     .await;
     match rebuild {
@@ -149,6 +157,7 @@ pub async fn auto_update_loop(
     tunnel: Tunnel,
     raw_config: Arc<RwLock<RawConfig>>,
     resolver: Arc<Resolver>,
+    cache_dir: PathBuf,
 ) {
     let interval = std::time::Duration::from_secs(geo.auto_update_interval as u64 * 3600);
     let mut ticker = tokio::time::interval(interval);
@@ -199,7 +208,14 @@ pub async fn auto_update_loop(
         let raw = raw_config.read().clone();
         let rebuild = tokio::task::spawn_blocking({
             let resolver = Arc::clone(&resolver);
-            move || meow_config::rebuild_from_raw_with_resolver(&raw, Some(resolver))
+            let cache_dir = cache_dir.clone();
+            move || {
+                meow_config::rebuild_from_raw_with_resolver(
+                    &raw,
+                    Some(resolver),
+                    Some(cache_dir.as_path()),
+                )
+            }
         })
         .await;
         match rebuild {

@@ -15,6 +15,11 @@ use tracing::{error, info};
 /// remote config, replace proxies/groups/rules, rebuild the tunnel, and
 /// persist back to `config_path`. Runs forever; spawn as a background task.
 pub async fn run_loop(raw_config: Arc<RwLock<RawConfig>>, tunnel: Tunnel, config_path: String) {
+    // Same provider-cache directory `load_config` used at startup — trusted
+    // rebuilds of the daemon's own config must keep resolving relative
+    // rule-provider paths the same way, not hard-fail with `cache_dir: None`
+    // (issue #429 follow-up).
+    let cache_dir = meow_config::resource_cache_dir_for_config_path(&config_path);
     loop {
         let subs_to_refresh: Vec<(String, String)> = {
             let raw = raw_config.read();
@@ -68,8 +73,13 @@ pub async fn run_loop(raw_config: Arc<RwLock<RawConfig>>, tunnel: Tunnel, config
                     let resolver = Arc::clone(tunnel.resolver());
                     let rebuild = tokio::task::spawn_blocking({
                         let snapshot = snapshot.clone();
+                        let cache_dir = cache_dir.clone();
                         move || {
-                            meow_config::rebuild_from_raw_with_resolver(&snapshot, Some(resolver))
+                            meow_config::rebuild_from_raw_with_resolver(
+                                &snapshot,
+                                Some(resolver),
+                                Some(cache_dir.as_path()),
+                            )
                         }
                     })
                     .await;

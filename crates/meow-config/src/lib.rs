@@ -416,22 +416,42 @@ pub fn rebuild_from_raw(raw: &raw::RawConfig) -> Result<RebuildResult, anyhow::E
 
 /// Rebuild proxies/rules and inject `resolver` into the built-in DIRECT
 /// adapter so it avoids the OS resolver when dialing hostnames.
+///
+/// `cache_dir` should be the same provider-cache directory the config was
+/// originally loaded with (see [`resource_cache_dir_for_config_path`]) —
+/// this is a *trusted* rebuild of the daemon's own running config, not an
+/// untrusted candidate, so relative rule-provider `path`s must keep
+/// resolving the same way they did at startup instead of hard-failing
+/// (issue #429 follow-up).
 pub fn rebuild_from_raw_with_resolver(
     raw: &raw::RawConfig,
     resolver: Option<Arc<Resolver>>,
+    cache_dir: Option<&Path>,
 ) -> Result<RebuildResult, anyhow::Error> {
-    rebuild_from_raw_impl(raw, None, resolver, &HashMap::new(), None, None, None)
+    rebuild_from_raw_impl(raw, cache_dir, resolver, &HashMap::new(), None, None, None)
 }
 
 /// Runtime rebuild variant that keeps live proxy-provider slots and the
 /// process-wide selection store wired into rebuilt groups.
+///
+/// See [`rebuild_from_raw_with_resolver`] for why `cache_dir` must be the
+/// startup provider-cache directory rather than `None`.
 pub fn rebuild_from_raw_runtime(
     raw: &raw::RawConfig,
     resolver: Option<Arc<Resolver>>,
     providers: &HashMap<String, Arc<ProxyProvider>>,
+    cache_dir: Option<&Path>,
 ) -> Result<RebuildResult, anyhow::Error> {
     let store = meow_proxy::SelectorStore::global();
-    rebuild_from_raw_impl(raw, None, resolver, providers, store.as_ref(), None, None)
+    rebuild_from_raw_impl(
+        raw,
+        cache_dir,
+        resolver,
+        providers,
+        store.as_ref(),
+        None,
+        None,
+    )
 }
 
 /// Same as [`rebuild_from_raw`] but accepts a `cache_dir` used to resolve
@@ -1393,7 +1413,16 @@ fn default_config_dir_without_home_override() -> PathBuf {
     base.join("meow")
 }
 
-fn resource_cache_dir_for_config_path(path: &str) -> PathBuf {
+/// Resolve the provider-cache directory for a config file path — the same
+/// directory [`load_config`] threads through as `cache_dir` at startup.
+///
+/// Trusted runtime rebuilds (subscription refresh, geodata rebuild, the
+/// config-mutating API endpoints) must recompute this from the daemon's own
+/// `config_path` and pass it back into [`rebuild_from_raw_with_resolver`] /
+/// [`rebuild_from_raw_runtime`] rather than passing `None`, or relative
+/// rule-provider `path`s that loaded fine at startup start hard-failing on
+/// every rebuild (issue #429 follow-up).
+pub fn resource_cache_dir_for_config_path(path: &str) -> PathBuf {
     resource_cache_dir_for_config_path_with_home(path, meow_common::meow_home_dir())
 }
 
@@ -2534,10 +2563,16 @@ rules:
 
     #[test]
     fn rebuild_rejects_file_provider_path_without_cache_dir() {
-        // `rebuild_from_raw` is the `cache_dir = None` path used by runtime
-        // rebuilds (`PUT /configs` goes through `rebuild_from_raw_runtime`,
-        // which shares the same impl): there is no containment root, so a
-        // caller-named file path is a hard error.
+        // `rebuild_from_raw` is the genuinely rootless `cache_dir = None`
+        // path (FFI callers with no on-disk config, plain unit tests, …).
+        // Trusted daemon rebuilds — subscription refresh, geodata rebuild,
+        // and `PUT /configs` via `rebuild_from_raw_runtime` — always thread
+        // the real startup provider-cache dir through instead (issue #429
+        // follow-up), so they hit the `Some(cache_dir)` path below, not
+        // this one.
+        //
+        // Here there is no containment root at all, so a caller-named file
+        // path is a hard error.
         let raw: raw::RawConfig = serde_yaml::from_str(
             r#"
 rule-providers:
@@ -2557,6 +2592,53 @@ rules:
             err.to_string().contains("cache directory"),
             "unexpected: {err}"
         );
+    }
+
+    #[test]
+    fn trusted_runtime_rebuilds_keep_working_with_a_file_rule_provider() {
+        // Regression for the PR #444 review finding: a config with a plain
+        // file rule-provider (the repo's own
+        // `test_file_rule_provider_end_to_end` shape) loads fine at startup
+        // and must keep rebuilding fine on every trusted runtime path —
+        // subscription refresh, geodata rebuild, and the `PUT /configs`
+        // family — once the real cache dir is threaded through instead of
+        // `None`.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("ads.yaml"),
+            "payload:\n  - '+.ads.example'\n",
+        )
+        .unwrap();
+        let raw: raw::RawConfig = serde_yaml::from_str(
+            r#"
+rule-providers:
+  ads:
+    type: file
+    behavior: domain
+    format: yaml
+    path: ads.yaml
+rules:
+  - RULE-SET,ads,REJECT
+  - "MATCH,DIRECT"
+"#,
+        )
+        .unwrap();
+
+        // `rebuild_from_raw_with_resolver` — used by subscription_refresh
+        // and geodata_fetch.
+        let (_, rules) =
+            rebuild_from_raw_with_resolver(&raw, None, Some(dir.path())).expect(
+                "trusted rebuild with the real cache dir must not hard-fail on a file provider",
+            );
+        assert_eq!(rules.len(), 2);
+
+        // `rebuild_from_raw_runtime` — used by meow-api's `PUT /configs`
+        // family via `rebuild_from_raw_with_resolver_async`.
+        let (_, rules) =
+            rebuild_from_raw_runtime(&raw, None, &HashMap::new(), Some(dir.path())).expect(
+                "trusted runtime rebuild with the real cache dir must not hard-fail on a file provider",
+            );
+        assert_eq!(rules.len(), 2);
     }
 
     #[test]

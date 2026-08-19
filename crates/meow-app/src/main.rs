@@ -878,8 +878,12 @@ async fn run(
         let tunnel = tunnel.clone();
         let raw_config = Arc::clone(&raw_config);
         let resolver = Arc::clone(&resolver);
+        let cache_dir = meow_config::resource_cache_dir_for_config_path(&config_path);
         tokio::spawn(async move {
-            meow_app::geodata_fetch::run_on_startup(geodata, tunnel, raw_config, resolver).await;
+            meow_app::geodata_fetch::run_on_startup(
+                geodata, tunnel, raw_config, resolver, cache_dir,
+            )
+            .await;
         });
     }
 
@@ -889,8 +893,12 @@ async fn run(
         let tunnel = tunnel.clone();
         let raw_config = Arc::clone(&raw_config);
         let resolver = Arc::clone(&resolver);
+        let cache_dir = meow_config::resource_cache_dir_for_config_path(&config_path);
         tokio::spawn(async move {
-            meow_app::geodata_fetch::auto_update_loop(geodata, tunnel, raw_config, resolver).await;
+            meow_app::geodata_fetch::auto_update_loop(
+                geodata, tunnel, raw_config, resolver, cache_dir,
+            )
+            .await;
         });
     }
 
