@@ -7,11 +7,21 @@
 //!
 //! upstream: transport/vmess/h2.go
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use rand::seq::IndexedRandom as _;
 
 use crate::h2_common::{H2Stream, RecvState};
 use crate::{Result, Stream, Transport, TransportError};
+
+/// Timeout for acquiring send readiness (h2 `poll_ready`) during `connect`.
+/// Nothing upstream bounds the dial (`Tunnel::dial_tcp` and the transport
+/// chain carry no timeout), so without this a peer whose
+/// `SETTINGS_MAX_CONCURRENT_STREAMS` is exhausted — or that simply never
+/// settles — could park `connect` forever.  Mirrors h2mux's `OPEN_TIMEOUT`
+/// (5 s), which guards the same `ready()` call on the mux path.
+const OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 
 // ─── Public types ─────────────────────────────────────────────────────────────
 
@@ -91,10 +101,10 @@ impl Transport for H2Layer {
 
         // h2 requires poll_ready/ready before send_request: sending
         // without readiness is rejected once MAX_CONCURRENT_STREAMS is
-        // exhausted.
-        h2 = h2
-            .ready()
+        // exhausted.  Bounded by OPEN_TIMEOUT — see its doc.
+        h2 = tokio::time::timeout(OPEN_TIMEOUT, h2.ready())
             .await
+            .map_err(|_| TransportError::H2("timed out waiting for send readiness (open)".into()))?
             .map_err(|e| TransportError::H2(e.to_string()))?;
 
         // Open the h2 stream; `end_of_stream = false` — we will stream data.
