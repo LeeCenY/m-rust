@@ -191,12 +191,26 @@ impl AsyncWrite for H2Stream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
         let this = self.get_mut();
 
         // Stash the payload exactly once per logical write.  If pending_write
         // is already set, a previous poll returned Pending; capacity has been
-        // reserved — do not encode or reserve again.
-        if this.pending_write.is_none() {
+        // reserved - do not encode or reserve again.  A Pending poll must be
+        // retried with the same buffer; reject a changed buffer rather than
+        // silently sending stale bytes under its reported length.
+        if let Some(data) = &this.pending_write {
+            if buf != data.as_ref() {
+                this.pending_write = None;
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "h2: write buffer changed after Pending; \
+                     AsyncWrite requires retrying with the same buffer",
+                )));
+            }
+        } else {
             let data = Bytes::copy_from_slice(buf);
             this.send.reserve_capacity(data.len());
             this.pending_write = Some(data);
