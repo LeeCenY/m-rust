@@ -23,9 +23,12 @@ use tokio::io::{AsyncRead, AsyncWrite};
 pub use meow_transport::h2_common::H2Stream as Stream;
 use meow_transport::h2_common::{RecvState, StatusPolicy};
 
-/// Setup timeout for the CONNECT request/response round trip; mirrors
-/// sing-mux's `TCPTimeout` (5 s).  On expiry the read side fails with
-/// TimedOut (the caller tears the stream down).
+/// Timeout for the CONNECT response; mirrors sing-mux's `TCPTimeout`
+/// (5 s).  The deadline is armed when the stream is opened, but it is
+/// only *checked* while a read is being polled (`RecvState` resolves the
+/// response lazily on the first read), so a stream that is never read
+/// never times out.  On expiry the read side fails with TimedOut (the
+/// caller tears the stream down).
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Timeout for acquiring send readiness (h2 `poll_ready`).  Without this,

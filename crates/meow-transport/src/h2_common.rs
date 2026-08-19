@@ -120,12 +120,14 @@ pub struct H2Stream {
     send: h2::SendStream<Bytes>,
     recv: RecvState,
     read_buf: Bytes,
-    /// Pre-encoded payload stashed while waiting for h2 send-window
-    /// capacity, plus the number of bytes already handed to the
-    /// connection.  Only the ungranted remainder is ever sent, so a
-    /// peer that stops reading applies real backpressure instead of
-    /// growing h2's internal buffer.
-    pending_write: Option<(Bytes, usize)>,
+    /// Payload stashed while a `poll_write` waits for h2 send-window
+    /// capacity.  Only retained across a `Poll::Pending` return — every
+    /// `Ready` return (including a partial one) clears it, because after
+    /// `Ready(Ok(n))` the caller may legally submit a different buffer
+    /// (issue #423).  Only granted capacity is ever handed to the
+    /// connection, so a peer that stops reading applies real
+    /// backpressure instead of growing h2's internal buffer.
+    pending_write: Option<Bytes>,
     remote_no_error_is_eof: bool,
     eos_sent: bool,
 }
@@ -219,16 +221,17 @@ impl AsyncWrite for H2Stream {
             return Poll::Ready(Ok(0));
         }
         let this = self.get_mut();
-        // Stash the payload exactly once per logical write.  If
-        // pending_write is set, a previous poll returned Pending and
+        // Stash the payload exactly once per parked write.  If
+        // pending_write is set, the previous poll returned Pending and
         // capacity has been reserved — do not copy or reserve again.
         // A Pending poll must be retried with the same buffer; reject a
         // changed buffer rather than silently sending stale bytes under
-        // its reported length.  The comparison is offset-aware: after a
-        // partial send, write_all advances the buffer by the consumed
-        // amount, so the incoming buf matches &data[offset..].
-        if let Some((data, offset)) = &this.pending_write {
-            if buf != &data[*offset..] {
+        // its reported length.  This guard applies to the Pending path
+        // only: pending_write never survives a Ready return, so after a
+        // partial `Ready(Ok(n))` the caller is free to submit anything
+        // (issue #423).
+        if let Some(data) = &this.pending_write {
+            if buf != data.as_ref() {
                 this.pending_write = None;
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -239,7 +242,7 @@ impl AsyncWrite for H2Stream {
         } else {
             let data = Bytes::copy_from_slice(buf);
             this.send.reserve_capacity(data.len());
-            this.pending_write = Some((data, 0));
+            this.pending_write = Some(data);
         }
         match this.send.poll_capacity(cx) {
             Poll::Pending => Poll::Pending,
@@ -255,32 +258,36 @@ impl AsyncWrite for H2Stream {
                 Poll::Ready(Err(io::Error::other(error)))
             }
             Poll::Ready(Some(Ok(capacity))) => {
-                let (data, offset) = this.pending_write.as_mut().expect("set above");
-                let remaining = data.len() - *offset;
+                let data = this.pending_write.take().expect("set above");
                 // poll_capacity may grant less than the reserved amount
                 // (the peer's flow-control window); send only the
-                // granted prefix and keep the rest pending.
-                let allowed = capacity.min(remaining);
+                // granted prefix and report a short write.
+                let allowed = capacity.min(data.len());
                 if allowed == 0 {
                     // Unreachable: poll_capacity yields Some(Ok(n)) with
-                    // n > 0, and remaining == 0 implies pending_write was
-                    // already cleared.  Re-register the waker defensively
-                    // so a future code change cannot park this task forever.
-                    debug_assert!(allowed > 0, "h2: zero capacity grant with remaining data");
+                    // n > 0, and pending_write is never stashed empty.
+                    // Re-stash and re-register the waker defensively so a
+                    // future code change cannot park this task forever.
+                    debug_assert!(allowed > 0, "h2: zero capacity grant with pending data");
+                    this.pending_write = Some(data);
                     cx.waker().wake_by_ref();
                     return Poll::Pending;
                 }
-                let chunk = data.slice(*offset..*offset + allowed);
-                let chunk_len = chunk.len();
+                let chunk = data.slice(..allowed);
                 if let Err(error) = this.send.send_data(chunk, false) {
-                    this.pending_write = None;
                     return Poll::Ready(Err(io::Error::other(error)));
                 }
-                *offset += chunk_len;
-                if *offset >= data.len() {
-                    this.pending_write = None;
+                if allowed < data.len() {
+                    // Short write: the unsent remainder is dropped (the
+                    // caller re-submits it — or a different buffer — on
+                    // the next write), so hand its reservation back to
+                    // the connection instead of pinning window capacity
+                    // for bytes that may never arrive.  reserve_capacity
+                    // sets a target on top of already-buffered data, so 0
+                    // keeps what send_data just queued.
+                    this.send.reserve_capacity(0);
                 }
-                Poll::Ready(Ok(chunk_len))
+                Poll::Ready(Ok(allowed))
             }
         }
     }
@@ -296,3 +303,181 @@ impl AsyncWrite for H2Stream {
 }
 
 impl Unpin for H2Stream {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::poll_fn;
+    use tokio::io::AsyncWriteExt as _;
+
+    /// Payload larger than h2's default 65535-byte send window, so a write
+    /// against a stalled peer can never complete in one poll.
+    const STALLED_PAYLOAD_LEN: usize = 128 * 1024;
+
+    /// Open one client stream against a server that accepts the request and
+    /// then stops driving its connection: the request body is never read, so
+    /// the send window is never replenished and writes stall once the
+    /// initial window is spent.
+    async fn stalled_h2_stream() -> (H2Stream, tokio::task::JoinHandle<()>) {
+        let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+
+        let server = tokio::spawn(async move {
+            let mut connection = h2::server::Builder::new()
+                .handshake::<_, Bytes>(server_io)
+                .await
+                .expect("server handshake");
+            let _accepted = connection.accept().await;
+            // Never polled again: no WINDOW_UPDATE is ever sent back.
+            std::future::pending::<()>().await;
+        });
+
+        let (send_request, connection) = h2::client::handshake(client_io)
+            .await
+            .expect("client handshake");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        let request = http::Request::builder()
+            .method(http::Method::POST)
+            .uri("https://localhost")
+            .body(())
+            .expect("static request");
+        let mut send_request = send_request.ready().await.expect("send_request ready");
+        let (response, send_stream) = send_request
+            .send_request(request, false)
+            .expect("send_request");
+
+        (H2Stream::new(send_stream, RecvState::new(response)), server)
+    }
+
+    /// Poll `poll_write` exactly once, surfacing `Pending` as `None` instead
+    /// of parking the test.
+    async fn poll_write_once(stream: &mut H2Stream, buf: &[u8]) -> Option<io::Result<usize>> {
+        poll_fn(|cx| {
+            Poll::Ready(match Pin::new(&mut *stream).poll_write(cx, buf) {
+                Poll::Pending => None,
+                Poll::Ready(result) => Some(result),
+            })
+        })
+        .await
+    }
+
+    /// Issue #423: `pending_write` must not survive a partial
+    /// `Ready(Ok(n))`.  After a short write the caller may legally submit a
+    /// *different* buffer; the changed-buffer guard applies only to retries
+    /// after `Pending`.
+    #[tokio::test]
+    async fn partial_write_then_different_buffer_is_accepted() {
+        let (mut stream, _server) = stalled_h2_stream().await;
+        let payload = vec![b'a'; STALLED_PAYLOAD_LEN];
+
+        // Drive the first logical write to its first Ready(Ok(n)).  The send
+        // window (at most 64 KiB) cannot cover the payload, so the write is
+        // necessarily partial.
+        let sent = loop {
+            match poll_write_once(&mut stream, &payload).await {
+                // Capacity not assigned yet — let the connection task run.
+                None => tokio::task::yield_now().await,
+                Some(Ok(n)) => break n,
+                Some(Err(error)) => panic!("unexpected write error: {error}"),
+            }
+        };
+        assert!(sent < payload.len(), "expected a partial write");
+
+        // Submit a buffer with different contents.  Before the fix this
+        // tripped the identity guard and failed with InvalidInput; it must
+        // be treated as a fresh logical write.
+        let decoy = vec![b'b'; 64 * 1024];
+        loop {
+            match poll_write_once(&mut stream, &decoy).await {
+                // Parked on flow control — expected once the window is gone.
+                None => break,
+                Some(Ok(n)) => {
+                    assert!(n > 0, "poll_write must not return Ok(0) for data");
+                }
+                Some(Err(error)) => {
+                    panic!("a different buffer after a partial write must be accepted: {error}")
+                }
+            }
+        }
+    }
+
+    /// Dropping an `H2Stream` half-closes the request body with a clean
+    /// `end_of_stream` DATA frame instead of resetting the stream, so bytes
+    /// already accepted by the peer are not torn down retroactively.  This
+    /// pins the behaviour for both the plain `network: h2` transport and
+    /// h2mux, which share this type (issue #423, follow-up to #417).
+    #[tokio::test]
+    async fn drop_sends_end_of_stream_not_reset() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+
+        let server = tokio::spawn(async move {
+            let mut connection = h2::server::Builder::new()
+                .handshake::<_, Bytes>(server_io)
+                .await
+                .expect("server handshake");
+            let (request, mut respond) = connection
+                .accept()
+                .await
+                .expect("one request")
+                .expect("accept ok");
+            let mut body = request.into_body();
+            respond
+                .send_response(http::Response::new(()), true)
+                .expect("send response");
+
+            // Read the request body to completion while a second future
+            // keeps the connection driven (RecvStream does not drive IO).
+            let read_body = async {
+                let mut received = Vec::new();
+                loop {
+                    match body.data().await {
+                        Some(Ok(bytes)) => {
+                            let _ = body.flow_control().release_capacity(bytes.len());
+                            received.extend_from_slice(&bytes);
+                        }
+                        Some(Err(error)) => return Err(error),
+                        None => return Ok(received),
+                    }
+                }
+            };
+            let drive = async {
+                while connection.accept().await.is_some() {}
+                std::future::pending::<()>().await;
+            };
+            tokio::select! {
+                body_result = read_body => {
+                    let received = body_result.expect("drop must end the stream cleanly, not reset it");
+                    assert_eq!(received, b"hello", "bytes written before drop must survive");
+                }
+                () = drive => unreachable!("drive never resolves"),
+            }
+        });
+
+        let (send_request, connection) = h2::client::handshake(client_io)
+            .await
+            .expect("client handshake");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let request = http::Request::builder()
+            .method(http::Method::POST)
+            .uri("https://localhost")
+            .body(())
+            .expect("static request");
+        let mut send_request = send_request.ready().await.expect("send_request ready");
+        let (response, send_stream) = send_request
+            .send_request(request, false)
+            .expect("send_request");
+        let mut stream = H2Stream::new(send_stream, RecvState::new(response));
+
+        stream.write_all(b"hello").await.expect("write");
+        drop(stream);
+
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("server must observe end-of-stream")
+            .expect("server task");
+    }
+}
