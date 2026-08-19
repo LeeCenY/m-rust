@@ -210,6 +210,19 @@ pub fn decode_gun_frame(frame: &[u8]) -> std::result::Result<&[u8], TransportErr
     Ok(&inner[payload_start..payload_end])
 }
 
+/// Return `true` if `encoded` is exactly the gun-frame encoding of `payload`.
+///
+/// Used by [`GunStream::poll_write`] to verify that the buffer handed to a
+/// retry after `Pending` is the same one that was encoded into
+/// `pending_write` (the `AsyncWrite` contract).  Decodes the stashed frame
+/// and compares payload slices instead of re-encoding, so the check is
+/// allocation-free on the hot path (ADR-0008).  `encoded` always comes from
+/// [`encode_gun_frame`], so the decode cannot fail in practice; a decode
+/// failure conservatively reports a mismatch.
+fn gun_frame_matches(encoded: &[u8], payload: &[u8]) -> bool {
+    decode_gun_frame(encoded).is_ok_and(|p| p == payload)
+}
+
 /// Encode `n` as an unsigned LEB-128 (protobuf varint).
 fn encode_varint(mut n: u64) -> Vec<u8> {
     let mut buf = Vec::with_capacity(4);
@@ -272,7 +285,10 @@ struct GunStream {
     /// Pre-encoded gun frame stashed while we wait for send capacity.
     /// Set on the first `poll_write` call for a given buf; cleared when
     /// `send_data` succeeds.  This ensures `reserve_capacity` is called
-    /// exactly once per logical write.
+    /// exactly once per logical write.  A retry after `Pending` must pass
+    /// the same buffer (the `AsyncWrite` contract); `poll_write` enforces
+    /// this via [`gun_frame_matches`] and rejects a changed buffer with
+    /// `InvalidInput` instead of silently sending the stale frame.
     pending_write: Option<Bytes>,
 }
 
@@ -387,8 +403,23 @@ impl AsyncWrite for GunStream {
 
         // Encode buf into a gun frame exactly once per logical write.
         // If pending_write is already set, a previous poll returned Pending;
-        // capacity has been reserved — don't encode or reserve again.
-        if this.pending_write.is_none() {
+        // capacity has been reserved — don't encode or reserve again.  A
+        // Pending poll must be retried with the same buffer; reject a changed
+        // buffer rather than silently sending the stale frame under the new
+        // buffer's reported length (mirrors the H2Stream guard in h2_common).
+        // Unlike H2Stream there is no offset to track: the success arm below
+        // always sends the whole stashed frame, so an exact comparison of the
+        // stashed frame's payload against `buf` is correct.
+        if let Some(encoded) = &this.pending_write {
+            if !gun_frame_matches(encoded, buf) {
+                this.pending_write = None;
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "grpc: write buffer changed after Pending; \
+                     AsyncWrite requires retrying with the same buffer",
+                )));
+            }
+        } else {
             let encoded = Bytes::from(encode_gun_frame(buf));
             this.send.reserve_capacity(encoded.len());
             this.pending_write = Some(encoded);
