@@ -129,7 +129,7 @@ pub async fn download_and_replace(
         if !status.is_success() {
             return Err(anyhow!("HTTP {status} fetching {url}"));
         }
-        resp.bytes().await?.to_vec()
+        internal_http::response_bytes_with_limit(resp).await?
     };
 
     if let Some(parent) = dest.parent() {

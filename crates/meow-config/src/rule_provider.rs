@@ -627,7 +627,7 @@ pub(crate) async fn fetch_http_async(url: &str, proxy: Option<&Arc<dyn Proxy>>) 
         .build()?;
     let resp = client.get(url).send().await?;
     let status = resp.status();
-    let bytes = resp.bytes().await?;
+    let bytes = internal_http::response_bytes_with_limit(resp).await?;
     if !status.is_success() {
         return Err(anyhow!(
             "HTTP {}: {}",
@@ -638,7 +638,7 @@ pub(crate) async fn fetch_http_async(url: &str, proxy: Option<&Arc<dyn Proxy>>) 
                 .collect::<String>()
         ));
     }
-    Ok(bytes.to_vec())
+    Ok(bytes)
 }
 
 fn write_cache(path: &Path, bytes: &[u8]) {

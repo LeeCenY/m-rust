@@ -34,23 +34,42 @@ const READ_TIMEOUT: Duration = Duration::from_secs(60);
 const USER_AGENT: &str = concat!("clash.meta/", env!("CARGO_PKG_VERSION"));
 pub(crate) const MAX_BODY_BYTES: usize = 256 * 1024 * 1024; // 256 MiB hard ceiling
 
-pub(crate) async fn response_text_with_limit(resp: reqwest::Response) -> Result<String> {
+/// Consume `resp`'s body into a `Vec<u8>`, rejecting it before or during the
+/// read if it exceeds `MAX_BODY_BYTES`.
+///
+/// Checks `Content-Length` up front when present, then streams the body and
+/// bails as soon as the accumulated length would cross the cap — so a
+/// dishonest or absent `Content-Length` can't be used to smuggle an
+/// oversized body past the precheck.
+pub(crate) async fn response_bytes_with_limit(resp: reqwest::Response) -> Result<Vec<u8>> {
+    response_bytes_capped(resp, MAX_BODY_BYTES).await
+}
+
+/// Same as [`response_bytes_with_limit`] but with the cap as a parameter, so
+/// tests can exercise the precheck and streaming-cap paths against a small
+/// limit instead of transferring hundreds of megabytes.
+async fn response_bytes_capped(resp: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
     if resp
         .content_length()
-        .is_some_and(|length| length > MAX_BODY_BYTES as u64)
+        .is_some_and(|length| length > limit as u64)
     {
-        bail!("response exceeds max body size ({MAX_BODY_BYTES} bytes)");
+        bail!("response exceeds max body size ({limit} bytes)");
     }
 
     let mut bytes = Vec::new();
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
-        if chunk.len() > MAX_BODY_BYTES.saturating_sub(bytes.len()) {
-            bail!("response exceeds max body size ({MAX_BODY_BYTES} bytes)");
+        if chunk.len() > limit.saturating_sub(bytes.len()) {
+            bail!("response exceeds max body size ({limit} bytes)");
         }
         bytes.extend_from_slice(&chunk);
     }
+    Ok(bytes)
+}
+
+pub(crate) async fn response_text_with_limit(resp: reqwest::Response) -> Result<String> {
+    let bytes = response_bytes_with_limit(resp).await?;
     String::from_utf8(bytes).map_err(|e| anyhow!("response body is not UTF-8: {e}"))
 }
 
@@ -373,5 +392,61 @@ mod tests {
             err.to_string().contains("timed out"),
             "expected connect timeout, got: {err}"
         );
+    }
+
+    /// Spawns a bare TCP server on `127.0.0.1` that writes `raw_response`
+    /// verbatim to the first connection it accepts, then returns its URL.
+    async fn spawn_raw_http_server(raw_response: &'static [u8]) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            // Drain (part of) the request so the exchange is well-formed;
+            // the response below doesn't depend on what was sent.
+            let _ = stream.read(&mut buf).await;
+            let _ = stream.write_all(raw_response).await;
+            let _ = stream.shutdown().await;
+        });
+        format!("http://{addr}/")
+    }
+
+    // Regression test for issue #431: a dishonest (or merely huge)
+    // Content-Length must be rejected before any of the body is read.
+    #[tokio::test]
+    async fn response_bytes_capped_rejects_oversize_content_length() {
+        let url =
+            spawn_raw_http_server(b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\nshort").await;
+        let resp = reqwest::get(&url).await.unwrap();
+        let err = response_bytes_capped(resp, 16).await.unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds max body size"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // Regression test for issue #431: with no (or an absent) Content-Length
+    // — e.g. chunked encoding — the streaming cap must still catch an
+    // oversized body instead of buffering it in full.
+    #[tokio::test]
+    async fn response_bytes_capped_rejects_oversize_stream_without_content_length() {
+        let url = spawn_raw_http_server(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n10\r\n0123456789abcdef\r\n0\r\n\r\n",
+        )
+        .await;
+        let resp = reqwest::get(&url).await.unwrap();
+        let err = response_bytes_capped(resp, 8).await.unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds max body size"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn response_bytes_capped_accepts_body_within_limit() {
+        let url = spawn_raw_http_server(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello").await;
+        let resp = reqwest::get(&url).await.unwrap();
+        let bytes = response_bytes_capped(resp, 16).await.unwrap();
+        assert_eq!(bytes, b"hello");
     }
 }
