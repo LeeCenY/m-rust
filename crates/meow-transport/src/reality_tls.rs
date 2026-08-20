@@ -51,6 +51,15 @@ const GROUP_X25519: u16 = 0x001d;
 // few KB; `read_record` already caps a single record at 18 KiB, so a
 // legitimate flight cannot come close to either limit below. Mirrors
 // `MAX_GUN_FRAME_LEN` in `grpc.rs` and the size caps in `ws.rs`.
+//
+// Note these two constants are defense-in-depth, not the load-bearing
+// bound: that is `ServerFlightGuard`'s flight-ordering check, which admits
+// at most 3 messages (EncryptedExtensions / Certificate / CertificateVerify,
+// each exactly once, in order) of ~36 KiB each — a message must complete
+// within one 18 KiB record plus whatever partial tail the previous record
+// left buffered, or `pop_handshake_message` fails the loop. Changes to the
+// per-message size math must keep that guard intact; the caps below only
+// backstop it against future refactors.
 const MAX_PRE_AUTH_HS_MESSAGES: usize = 32;
 const MAX_PRE_AUTH_TRANSCRIPT_LEN: usize = 64 * 1024;
 
