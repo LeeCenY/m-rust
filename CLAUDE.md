@@ -133,8 +133,22 @@ cargo clippy --all-targets -- -D warnings
 cargo clippy --all-targets --no-default-features -- -D warnings
 cargo clippy --all-targets --all-features -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
-cargo test --lib
+
+# Mirrors the "Unit + integration tests (default features)" CI step. `--lib`
+# alone is not enough: it skips every `--test` target, so a broken integration
+# test (e.g. the ADR-0001 guard in `crate_invariants_test`) passes locally and
+# lands `main` red.
+cargo test --lib --bin meow \
+  --test common_test --test dns_cache_test --test config_test \
+  --test statistics_test --test rules_test --test api_test \
+  --test config_persistence_test --test systemd_config_test \
+  --test trojan_integration --test vless_config_test --test vless_integration \
+  --test v2ray_plugin_integration --test pre_resolve_test \
+  --test tls_test --test ws_test --test crate_invariants_test
 ```
+
+Keep the target list in sync with `.github/workflows/test.yml`; a new `tests/`
+file that CI runs but this list omits is invisible to the local bar.
 
 The three-way clippy check (default / no-default-features / all-features) is enforced in CI via `.github/workflows/test.yml` (added in M1, per ADR-0010 §3).
 
