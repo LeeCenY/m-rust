@@ -207,6 +207,31 @@ pub(crate) fn encode_keepalive_frame() -> Bytes {
     out.freeze()
 }
 
+/// Destination host parsed from a frame's address block.  IP destinations —
+/// the overwhelmingly common case on the UDP hot path — stay as `IpAddr`, so
+/// `dest_to_socket` builds the `SocketAddr` directly instead of round
+/// tripping through `to_string()`/reparse; domains (rare here) keep their
+/// raw bytes, same as before.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Dest {
+    Ip(IpAddr),
+    Domain(Vec<u8>),
+}
+
+impl Dest {
+    /// Render as a host string for the `&str`-based frame encoders
+    /// (`encode_new_frame`/`encode_data_frame`).  Test-only: the hot UDP
+    /// write path uses `encode_udp_data_frame` directly on raw octets and
+    /// never needs this.
+    #[cfg(test)]
+    fn host_string(&self) -> String {
+        match self {
+            Dest::Ip(ip) => ip.to_string(),
+            Dest::Domain(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+        }
+    }
+}
+
 /// Decoded meta block of a frame.
 #[derive(Debug)]
 pub(crate) struct FrameMeta {
@@ -214,7 +239,7 @@ pub(crate) struct FrameMeta {
     pub status: u8,
     pub option: u8,
     /// Per-frame destination (New frames and UDP Keep frames).
-    pub dest: Option<(Vec<u8>, u16)>,
+    pub dest: Option<(Dest, u16)>,
 }
 
 /// Parse a meta block (the bytes between meta_len and the payload).
@@ -273,8 +298,11 @@ pub(crate) fn decode_meta(meta: &[u8]) -> io::Result<FrameMeta> {
     })
 }
 
-/// Parse [port u16 BE][atype][address] into raw host bytes + port.
-fn parse_address(b: &[u8]) -> io::Result<(Vec<u8>, u16)> {
+/// Parse [port u16 BE][atype][address] into a destination + port.  IP
+/// addresses are kept as `IpAddr` (no `to_string()` allocation on this hot
+/// UDP-datagram-read path); only the rare domain case still allocates a
+/// `Vec<u8>`.
+fn parse_address(b: &[u8]) -> io::Result<(Dest, u16)> {
     if b.len() < 3 {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
@@ -282,7 +310,7 @@ fn parse_address(b: &[u8]) -> io::Result<(Vec<u8>, u16)> {
         ));
     }
     let port = u16::from_be_bytes([b[0], b[1]]);
-    let host = match b[2] {
+    let dest = match b[2] {
         ATYPE_IPV4 => {
             if b.len() < 7 {
                 return Err(io::Error::new(
@@ -290,8 +318,7 @@ fn parse_address(b: &[u8]) -> io::Result<(Vec<u8>, u16)> {
                     "mux.cool: truncated IPv4 address",
                 ));
             }
-            let ip = IpAddr::V4(std::net::Ipv4Addr::new(b[3], b[4], b[5], b[6]));
-            ip.to_string().into_bytes()
+            Dest::Ip(IpAddr::V4(std::net::Ipv4Addr::new(b[3], b[4], b[5], b[6])))
         }
         ATYPE_IPV6 => {
             if b.len() < 19 {
@@ -302,9 +329,7 @@ fn parse_address(b: &[u8]) -> io::Result<(Vec<u8>, u16)> {
             }
             let mut octets = [0u8; 16];
             octets.copy_from_slice(&b[3..19]);
-            IpAddr::V6(std::net::Ipv6Addr::from(octets))
-                .to_string()
-                .into_bytes()
+            Dest::Ip(IpAddr::V6(std::net::Ipv6Addr::from(octets)))
         }
         ATYPE_DOMAIN => {
             // Guard b[3] before reading it: a 3-byte block (port + atype
@@ -322,7 +347,7 @@ fn parse_address(b: &[u8]) -> io::Result<(Vec<u8>, u16)> {
                     "mux.cool: truncated domain address",
                 ));
             }
-            b[4..4 + len].to_vec()
+            Dest::Domain(b[4..4 + len].to_vec())
         }
         other => {
             return Err(io::Error::new(
@@ -331,7 +356,7 @@ fn parse_address(b: &[u8]) -> io::Result<(Vec<u8>, u16)> {
             ));
         }
     };
-    Ok((host, port))
+    Ok((dest, port))
 }
 
 // --- Events on a stream's inbound channel -----------------------------------
@@ -339,7 +364,7 @@ fn parse_address(b: &[u8]) -> io::Result<(Vec<u8>, u16)> {
 pub(crate) enum Event {
     Data {
         bytes: Bytes,
-        dest: Option<(Vec<u8>, u16)>,
+        dest: Option<(Dest, u16)>,
     },
     /// Server sent End for this stream: deliver a clean EOF.
     Eof,
@@ -524,7 +549,14 @@ impl MuxCoolSession {
 impl Drop for MuxCoolSession {
     fn drop(&mut self) {
         self.closed.store(true, Ordering::SeqCst);
-        self.done.notify_waiters();
+        // notify_one (not notify_waiters): the driver's `done.notified()`
+        // future is re-created fresh every loop iteration, so a drop
+        // landing in the gap between iterations - before the next
+        // `notified()` registers a waiter - would be missed by
+        // notify_waiters, which stores no permit. notify_one stores a
+        // permit for the next waiter to consume, matching the `space`
+        // Notify's arm-before-check pattern used elsewhere in this driver.
+        self.done.notify_one();
     }
 }
 
@@ -651,7 +683,7 @@ struct ReadState {
     pos: usize,
     sid: u16,
     option: u8,
-    dest: Option<(Vec<u8>, u16)>,
+    dest: Option<(Dest, u16)>,
 }
 
 impl ReadState {
@@ -1262,12 +1294,13 @@ impl Drop for PacketConn {
 }
 
 /// Resolve a frame destination to a SocketAddr; domains (rare on the UDP
-/// path) fall back to the stream's bound destination.
-fn dest_to_socket(host: &[u8], port: u16, fallback: SocketAddr) -> SocketAddr {
-    std::str::from_utf8(host)
-        .ok()
-        .and_then(|h| h.parse::<IpAddr>().ok())
-        .map_or(fallback, |ip| SocketAddr::new(ip, port))
+/// path) fall back to the stream's bound destination.  IP destinations
+/// build the SocketAddr directly - no string parse on this hot path.
+fn dest_to_socket(dest: &Dest, port: u16, fallback: SocketAddr) -> SocketAddr {
+    match dest {
+        Dest::Ip(ip) => SocketAddr::new(*ip, port),
+        Dest::Domain(_) => fallback,
+    }
 }
 
 #[async_trait::async_trait]
@@ -1293,8 +1326,8 @@ impl ProxyPacketConn for PacketConn {
                                 )));
                             }
                             buf[..bytes.len()].copy_from_slice(&bytes);
-                            let src = dest.map_or(self.bound, |(host, port)| {
-                                dest_to_socket(&host, port, self.bound)
+                            let src = dest.map_or(self.bound, |(dest, port)| {
+                                dest_to_socket(&dest, port, self.bound)
                             });
                             return Ok((bytes.len(), src));
                         }
@@ -1390,7 +1423,7 @@ mod tests {
     }
 
     /// (session id, network, destination) of an observed New frame.
-    type NewFrameLog = (u16, u8, Option<(Vec<u8>, u16)>);
+    type NewFrameLog = (u16, u8, Option<(Dest, u16)>);
 
     /// What the mock server observed, for assertions.
     #[derive(Default)]
@@ -1457,10 +1490,7 @@ mod tests {
                     let mut data = vec![0u8; data_len as usize];
                     io.read_exact(&mut data).await.unwrap();
                     log.lock().unwrap().data_frames += 1;
-                    let dest = frame
-                        .dest
-                        .as_ref()
-                        .map(|(h, p)| (String::from_utf8(h.clone()).unwrap(), *p));
+                    let dest = frame.dest.as_ref().map(|(d, p)| (d.host_string(), *p));
                     let echo = encode_data_frame(
                         frame.session_id,
                         &data,
@@ -1569,8 +1599,8 @@ mod tests {
         let ip: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
         assert_eq!(&frame[10..26], &ip.octets());
         let decoded = decode_meta(&frame[2..]).unwrap();
-        let (host, port) = decoded.dest.expect("New frame must carry a destination");
-        assert_eq!(host, b"2001:db8::1");
+        let (dest, port) = decoded.dest.expect("New frame must carry a destination");
+        assert_eq!(dest, Dest::Ip("2001:db8::1".parse().unwrap()));
         assert_eq!(port, 443);
     }
 
@@ -1724,6 +1754,27 @@ mod tests {
         assert_eq!(decoded.session_id, 1);
         assert_eq!(decoded.status, STATUS_NEW);
         assert_eq!(decoded.dest.as_ref().unwrap().1, 80);
+    }
+
+    /// Pins the UDP read-path allocation fix (issue #427): `parse_address`
+    /// must hand back `Dest::Ip` directly (no `to_string()`/reparse round
+    /// trip), and `dest_to_socket` must build the SocketAddr straight from
+    /// it. Domain destinations still fall back to the stream's bound addr.
+    #[test]
+    fn dest_to_socket_uses_ip_directly_and_falls_back_for_domains() {
+        let (dest, port) = parse_address(&[0x1F, 0x90, ATYPE_IPV4, 10, 0, 2, 2]).unwrap();
+        assert_eq!(dest, Dest::Ip("10.0.2.2".parse().unwrap()));
+        let fallback: SocketAddr = "192.0.2.1:9".parse().unwrap();
+        assert_eq!(
+            dest_to_socket(&dest, port, fallback),
+            "10.0.2.2:8080".parse::<SocketAddr>().unwrap()
+        );
+
+        let mut domain_bytes = vec![0x00, 0x50, ATYPE_DOMAIN, 4];
+        domain_bytes.extend_from_slice(b"host");
+        let (dest, _) = parse_address(&domain_bytes).unwrap();
+        assert!(matches!(dest, Dest::Domain(ref b) if b == b"host"));
+        assert_eq!(dest_to_socket(&dest, 80, fallback), fallback);
     }
 
     // --- Session round trips -------------------------------------------------
@@ -1967,7 +2018,11 @@ mod tests {
         wait_for(&log, "End frame", |l| !l.end_frames.is_empty()).await;
         assert_eq!(
             log.lock().unwrap().new_frames[0],
-            (1, NETWORK_TCP, Some((b"10.0.2.2".to_vec(), 18081)))
+            (
+                1,
+                NETWORK_TCP,
+                Some((Dest::Ip("10.0.2.2".parse().unwrap()), 18081))
+            )
         );
         assert_eq!(log.lock().unwrap().end_frames[0], 1);
     }

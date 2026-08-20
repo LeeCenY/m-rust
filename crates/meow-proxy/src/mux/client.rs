@@ -142,7 +142,12 @@ impl SessionKind {
         }
     }
 
-    pub(crate) fn is_dead(&self) -> bool {
+    /// True when the pool must stop offering this session for new streams
+    /// (physical connection dead, or - Mux.Cool only - its stream id space
+    /// retired). Named `is_unusable`, not `is_dead`: a retired Mux.Cool
+    /// session is still fully alive for the streams it already opened, so
+    /// "dead" would mislead.
+    pub(crate) fn is_unusable(&self) -> bool {
         match self {
             SessionKind::Smux(session) => session.is_dead(),
             SessionKind::Yamux(session) => session.is_dead(),
@@ -470,7 +475,7 @@ impl MuxClient {
         let mut sessions = self.sessions.lock().await;
         let now = now_ms();
         sessions.retain(|s| {
-            if s.kind.is_dead() {
+            if s.kind.is_unusable() {
                 return false;
             }
             // Truncated-domain comparison (never widen to u64 first): on

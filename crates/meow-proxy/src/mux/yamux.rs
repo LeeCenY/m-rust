@@ -119,6 +119,20 @@ impl Session {
     }
 }
 
+impl Drop for Session {
+    fn drop(&mut self) {
+        // Converges with h2mux::Session / smux::Session: aborting the
+        // driver task drops the physical connection (and its fd)
+        // immediately, instead of relying on `open_tx` closing to end the
+        // driver loop. That path works today (MuxStreamKind::Yamux holds a
+        // bare yamux::Stream with no back-reference to the Session, so
+        // dropping the last stream does not itself end the driver), but an
+        // evicted zero-stream session should not be able to keep the
+        // socket alive waiting on the peer.
+        self._task.abort();
+    }
+}
+
 /// One yamux stream, exposed with tokio IO traits.
 pub struct Stream {
     inner: tokio_util::compat::Compat<yamux::Stream>,
@@ -252,5 +266,71 @@ mod tests {
             stream.read_exact(&mut resp).await.unwrap();
             assert_eq!(resp, payload);
         }
+    }
+
+    /// IO wrapper that flags when dropped, so a test can observe the
+    /// physical connection actually being released (mirrors smux's
+    /// equivalent test helper).
+    struct DropTrackedIo {
+        inner: tokio::io::DuplexStream,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Drop for DropTrackedIo {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl AsyncRead for DropTrackedIo {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for DropTrackedIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        }
+    }
+
+    /// Pins issue #427's yamux/h2mux driver-shutdown convergence: dropping
+    /// the last `Session` reference must release the physical IO promptly
+    /// (via the new `Drop` impl's `_task.abort()`), the same invariant
+    /// h2mux::Session and smux::Session already guarantee.
+    #[tokio::test]
+    async fn dropping_idle_session_releases_physical_io() {
+        let (client_io, _server_io) = tokio::io::duplex(64 * 1024);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let session = Session::client(DropTrackedIo {
+            inner: client_io,
+            dropped: Arc::clone(&dropped),
+        })
+        .unwrap();
+        drop(session);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !dropped.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping an idle session must stop its driver and release the fd");
     }
 }
