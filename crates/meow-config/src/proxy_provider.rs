@@ -394,6 +394,41 @@ impl ProxyProvider {
     }
 }
 
+/// Validate every proxy-provider's on-disk path up front, so a path escaping
+/// the provider cache directory fails the whole (re)build loudly — matching
+/// `rule_provider::validate_paths` — instead of the provider being silently
+/// warn-skipped and every group referencing it degrading (PR #444 review
+/// follow-up).
+///
+/// Scope is containment only: paths that resolve outside `cache_dir`
+/// (explicit `path:` or the implicit name-derived cache location). Other
+/// per-provider problems (missing fields, unknown type, fetch failures) keep
+/// their historical warn-and-skip semantics in [`ProxyProvider::new`] /
+/// [`load_proxy_providers`]. Must stay in sync with the path resolution in
+/// [`ProxyProvider::new`].
+pub(crate) fn validate_paths(
+    raw_map: &HashMap<String, RawProxyProvider>,
+    cache_dir: Option<&Path>,
+) -> Result<(), String> {
+    // No containment root: no on-disk path is honoured at all, so there is
+    // nothing to contain (`ProxyProvider::new` errors/warns per provider).
+    let Some(dir) = cache_dir else {
+        return Ok(());
+    };
+    for (name, raw) in raw_map {
+        let requested = match (raw.provider_type.as_str(), raw.path.as_deref()) {
+            ("file" | "http", Some(p)) => PathBuf::from(p),
+            // The implicit http cache location is derived from the provider
+            // *name* (a YAML map key, also attacker-influenced).
+            ("http", None) => PathBuf::from(format!("provider_{name}.yaml")),
+            _ => continue,
+        };
+        crate::safe_path::resolve_contained(dir, &requested)
+            .map_err(|e| format!("proxy-provider '{name}': {e}"))?;
+    }
+    Ok(())
+}
+
 pub async fn load_proxy_providers(
     raw_map: &HashMap<String, RawProxyProvider>,
     cache_dir: Option<&Path>,
@@ -528,6 +563,46 @@ mod tests {
             panic!("escaping http cache path must be rejected");
         };
         assert!(err.contains("escapes"), "unexpected: {err}");
+    }
+
+    // PR #444 review follow-up: a proxy-provider path escaping the cache dir
+    // must fail the whole rebuild loudly (rule-provider parity), not just
+    // warn-skip the provider and silently degrade the groups using it.
+    #[test]
+    fn validate_paths_rejects_escaping_provider_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        for path in ["../../etc/pwned", "/etc/cron.d/pwned"] {
+            let mut map = HashMap::new();
+            map.insert("evil".to_string(), raw_file_provider(path));
+            let err = validate_paths(&map, Some(dir.path()))
+                .expect_err("escaping path must fail validation");
+            assert!(err.contains("evil"), "must name the provider: {err}");
+            assert!(err.contains("escapes"), "path {path}: unexpected: {err}");
+        }
+    }
+
+    #[test]
+    fn validate_paths_accepts_contained_and_pathless_providers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut map = HashMap::new();
+        map.insert("f".to_string(), raw_file_provider("sub/proxies.yaml"));
+        map.insert(
+            "h".to_string(),
+            RawProxyProvider {
+                provider_type: "http".to_string(),
+                url: Some("http://127.0.0.1:1/proxies.yaml".to_string()),
+                path: None, // implicit cache location from the name
+                interval: None,
+                filter: None,
+                exclude_filter: None,
+                exclude_type: None,
+                health_check: None,
+                header: None,
+            },
+        );
+        validate_paths(&map, Some(dir.path())).expect("contained paths must validate");
+        // Rootless context: nothing on disk is honoured, nothing to contain.
+        validate_paths(&map, None).expect("no cache dir means nothing to validate");
     }
 
     #[test]

@@ -688,12 +688,17 @@ fn rebuild_from_raw_impl(
     // groups and provider-sourced proxies included (issue #377).
     let registry_lookup = |name: &str| proxies.get(name).cloned();
 
-    // Fail hard on any rule-provider path that would escape the provider
-    // cache directory — before any fetch or on-disk write happens, so a
-    // hostile `PUT /configs` is rejected without touching the filesystem
-    // (issue #429).
+    // Fail hard on any rule- or proxy-provider path that would escape the
+    // provider cache directory — before any fetch or on-disk write happens,
+    // so a hostile `PUT /configs` is rejected without touching the
+    // filesystem (issue #429). Proxy-providers get the same loud failure as
+    // rule-providers (PR #444 review follow-up) instead of being warn-skipped
+    // with every group referencing them silently degrading.
     if let Some(map) = raw.rule_providers.as_ref() {
         rule_provider::validate_paths(map, cache_dir)?;
+    }
+    if let Some(map) = raw.proxy_providers.as_ref() {
+        proxy_provider::validate_paths(map, cache_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
     }
 
     // Fetch/read rule-provider payload bytes once — the parser-context build
@@ -2559,6 +2564,36 @@ rules:
             panic!("escaping rule-provider path must fail the rebuild");
         };
         assert!(err.to_string().contains("escapes"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn rebuild_rejects_proxy_provider_path_escaping_cache_dir() {
+        // PR #444 review follow-up: proxy-provider containment violations
+        // fail the rebuild loudly (rule-provider parity) instead of the
+        // provider being warn-skipped and its groups silently degrading.
+        let dir = tempfile::tempdir().unwrap();
+        let raw: raw::RawConfig = serde_yaml::from_str(
+            r#"
+proxy-providers:
+  evil:
+    type: http
+    url: "http://127.0.0.1:1/proxies.yaml"
+    path: "/etc/cron.d/pwned"
+proxy-groups:
+  - name: g
+    type: select
+    use: [evil]
+rules:
+  - "MATCH,DIRECT"
+"#,
+        )
+        .unwrap();
+        let Err(err) = rebuild_from_raw_with_cache_dir(&raw, Some(dir.path()), None) else {
+            panic!("escaping proxy-provider path must fail the rebuild");
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("evil"), "must name the provider: {msg}");
+        assert!(msg.contains("escapes"), "unexpected: {msg}");
     }
 
     #[test]
