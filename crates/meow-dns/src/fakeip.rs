@@ -931,36 +931,117 @@ mod tests {
         );
     }
 
+    /// Table-driven merge of the former `skipper_blacklist_skips_matched`,
+    /// `skipper_whitelist_skips_unmatched`, `skipper_plain_entry_is_suffix`
+    /// and `skipper_empty_filter_never_skips` cases. Every row is evaluated
+    /// even if an earlier one fails; all failures are reported together with
+    /// their case label.
     #[test]
-    fn skipper_blacklist_skips_matched() {
-        let s = Skipper::new(&["+.local".to_string()], SkipperMode::BlackList);
-        assert!(s.should_skip("foo.local"));
-        assert!(s.should_skip("local"));
-        assert!(!s.should_skip("example.com"));
-    }
+    fn skipper_table_driven_cases() {
+        struct Case {
+            label: &'static str,
+            patterns: &'static [&'static str],
+            mode: SkipperMode,
+            host: &'static str,
+            expect_skip: bool,
+        }
 
-    #[test]
-    fn skipper_whitelist_skips_unmatched() {
-        let s = Skipper::new(&["+.example.com".to_string()], SkipperMode::WhiteList);
-        assert!(!s.should_skip("foo.example.com"));
-        assert!(s.should_skip("other.test"));
-    }
+        let cases = [
+            // BlackList: a `+.` pattern matches sub-domains AND the bare root.
+            Case {
+                label: "blacklist/+.local/sub",
+                patterns: &["+.local"],
+                mode: SkipperMode::BlackList,
+                host: "foo.local",
+                expect_skip: true,
+            },
+            Case {
+                label: "blacklist/+.local/root",
+                patterns: &["+.local"],
+                mode: SkipperMode::BlackList,
+                host: "local",
+                expect_skip: true,
+            },
+            Case {
+                label: "blacklist/+.local/unrelated",
+                patterns: &["+.local"],
+                mode: SkipperMode::BlackList,
+                host: "example.com",
+                expect_skip: false,
+            },
+            // WhiteList inverts: matched hosts keep fake-ip, others bypass.
+            Case {
+                label: "whitelist/+.example.com/matched",
+                patterns: &["+.example.com"],
+                mode: SkipperMode::WhiteList,
+                host: "foo.example.com",
+                expect_skip: false,
+            },
+            Case {
+                label: "whitelist/+.example.com/unmatched",
+                patterns: &["+.example.com"],
+                mode: SkipperMode::WhiteList,
+                host: "other.test",
+                expect_skip: true,
+            },
+            // A plain entry is a suffix match that also covers the root, and
+            // must respect label boundaries (not a raw substring match).
+            Case {
+                label: "blacklist/plain/sub",
+                patterns: &["example.com"],
+                mode: SkipperMode::BlackList,
+                host: "foo.example.com",
+                expect_skip: true,
+            },
+            Case {
+                label: "blacklist/plain/root",
+                patterns: &["example.com"],
+                mode: SkipperMode::BlackList,
+                host: "example.com",
+                expect_skip: true,
+            },
+            Case {
+                label: "blacklist/plain/label-boundary",
+                patterns: &["example.com"],
+                mode: SkipperMode::BlackList,
+                host: "notexample.com",
+                expect_skip: false,
+            },
+            // Empty filter never skips — including WhiteList, where the naive
+            // reading would bypass every host (defensive foot-gun guard).
+            Case {
+                label: "empty/blacklist",
+                patterns: &[],
+                mode: SkipperMode::BlackList,
+                host: "foo.test",
+                expect_skip: false,
+            },
+            Case {
+                label: "empty/whitelist-defensive",
+                patterns: &[],
+                mode: SkipperMode::WhiteList,
+                host: "foo.test",
+                expect_skip: false,
+            },
+        ];
 
-    #[test]
-    fn skipper_plain_entry_is_suffix() {
-        let s = Skipper::new(&["example.com".to_string()], SkipperMode::BlackList);
-        assert!(s.should_skip("foo.example.com"));
-        assert!(s.should_skip("example.com"));
-        assert!(!s.should_skip("notexample.com"));
-    }
-
-    #[test]
-    fn skipper_empty_filter_never_skips() {
-        let s = Skipper::new(&[], SkipperMode::BlackList);
-        assert!(!s.should_skip("foo.test"));
-        // Whitelist + empty = treated as "skip nothing" (defensive).
-        let s = Skipper::new(&[], SkipperMode::WhiteList);
-        assert!(!s.should_skip("foo.test"));
+        let mut failures = Vec::new();
+        for c in &cases {
+            let patterns: Vec<String> = c.patterns.iter().copied().map(String::from).collect();
+            let skipper = Skipper::new(&patterns, c.mode);
+            let got = skipper.should_skip(c.host);
+            if got != c.expect_skip {
+                failures.push(format!(
+                    "[{}] Skipper::new({:?}, {:?}).should_skip({:?}) = {got}, want {}",
+                    c.label, c.patterns, c.mode, c.host, c.expect_skip
+                ));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "skipper cases failed:\n{}",
+            failures.join("\n")
+        );
     }
 
     #[tokio::test]

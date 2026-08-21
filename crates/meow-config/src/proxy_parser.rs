@@ -2367,16 +2367,24 @@ tls: true
 
     #[cfg(feature = "ss")]
     #[test]
-    fn test_serialize_plugin_opts_empty_map() {
-        let yaml = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
-        assert!(serialize_plugin_opts(&yaml).is_none());
-    }
-
-    #[cfg(feature = "ss")]
-    #[test]
-    fn test_serialize_plugin_opts_null() {
-        let yaml = serde_yaml::Value::Null;
-        assert!(serialize_plugin_opts(&yaml).is_none());
+    fn test_serialize_plugin_opts_none_cases() {
+        // Every empty-ish YAML value must serialize to None. `empty mapping`
+        // exercises the `parts.is_empty()` branch; `null` exercises the
+        // catch-all arm of serialize_plugin_opts.
+        let cases: [(&str, serde_yaml::Value); 2] = [
+            (
+                "empty mapping",
+                serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
+            ),
+            ("null", serde_yaml::Value::Null),
+        ];
+        for (label, yaml) in cases {
+            assert!(
+                serialize_plugin_opts(&yaml).is_none(),
+                "{label}: expected None, got {:?}",
+                serialize_plugin_opts(&yaml)
+            );
+        }
     }
 
     #[cfg(feature = "ss")]
@@ -2548,24 +2556,82 @@ tls: true
 
     #[cfg(feature = "hysteria2")]
     #[test]
-    fn parse_hysteria2_rejects_missing_password() {
-        let cfg = hy2_config("name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\nport: 443\n");
-        let Err(err) = parse_proxy(&cfg) else {
-            panic!("must hard-error");
-        };
-        assert!(err.contains("missing password"), "msg: {err}");
-    }
+    fn parse_hysteria2_rejects_invalid_configs() {
+        // (label, yaml, expected error substring)
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "missing password",
+                "name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\nport: 443\n",
+                "missing password",
+            ),
+            (
+                "zero port without ports",
+                "name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\nport: 0\npassword: secret\n",
+                "port must be non-zero",
+            ),
+            (
+                "missing both port and ports",
+                "name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\npassword: secret\n",
+                "missing port",
+            ),
+            (
+                "wildcard ports without port",
+                "name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\nports: '*'\npassword: secret\n",
+                "missing port",
+            ),
+            (
+                "empty password",
+                "name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\nport: 443\npassword: ''\n",
+                "password must not be empty",
+            ),
+            (
+                "gecko obfs (mihomo divergence: unsupported)",
+                "name: jp-hy2\n\
+                 type: hysteria2\n\
+                 server: 1.2.3.4\n\
+                 port: 443\n\
+                 password: secret\n\
+                 obfs: gecko\n\
+                 obfs-password: secret\n",
+                "gecko",
+            ),
+            (
+                "obfs without obfs-password",
+                "name: jp-hy2\n\
+                 type: hysteria2\n\
+                 server: 1.2.3.4\n\
+                 port: 443\n\
+                 password: secret\n\
+                 obfs: salamander\n",
+                "missing obfs-password",
+            ),
+            (
+                "mTLS client certificate (mihomo divergence: unsupported)",
+                "name: jp-hy2\n\
+                 type: hysteria2\n\
+                 server: 1.2.3.4\n\
+                 port: 443\n\
+                 password: secret\n\
+                 certificate: ./client.crt\n",
+                "certificate",
+            ),
+        ];
 
-    #[cfg(feature = "hysteria2")]
-    #[test]
-    fn parse_hysteria2_rejects_zero_port() {
-        let cfg = hy2_config(
-            "name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\nport: 0\npassword: secret\n",
-        );
-        let Err(err) = parse_proxy(&cfg) else {
-            panic!("must hard-error");
-        };
-        assert!(err.contains("port must be non-zero"), "msg: {err}");
+        // Collect every failure instead of asserting inline so one bad row does
+        // not mask the rest of the table.
+        let mut failures: Vec<String> = Vec::new();
+        for &(label, yaml, expected) in cases {
+            match parse_proxy(&hy2_config(yaml)) {
+                Ok(_) => failures.push(format!("[{label}] must hard-error (Class A), got Ok")),
+                Err(err) if !err.contains(expected) => {
+                    failures.push(format!(
+                        "[{label}] error must contain {expected:?}, got: {err}"
+                    ));
+                }
+                Err(_) => {}
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     #[cfg(feature = "hysteria2")]
@@ -2586,39 +2652,6 @@ tls: true
             "name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\nport: 0\nports: '443,8443'\npassword: secret\n",
         );
         assert!(parse_proxy(&cfg).is_ok());
-    }
-
-    #[cfg(feature = "hysteria2")]
-    #[test]
-    fn parse_hysteria2_rejects_missing_port_and_ports() {
-        let cfg = hy2_config("name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\npassword: secret\n");
-        let Err(err) = parse_proxy(&cfg) else {
-            panic!("must hard-error");
-        };
-        assert!(err.contains("missing port"), "msg: {err}");
-    }
-
-    #[cfg(feature = "hysteria2")]
-    #[test]
-    fn parse_hysteria2_rejects_wildcard_ports_without_port() {
-        let cfg = hy2_config(
-            "name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\nports: '*'\npassword: secret\n",
-        );
-        let Err(err) = parse_proxy(&cfg) else {
-            panic!("must hard-error");
-        };
-        assert!(err.contains("missing port"), "msg: {err}");
-    }
-
-    #[cfg(feature = "hysteria2")]
-    #[test]
-    fn parse_hysteria2_rejects_empty_password() {
-        let cfg =
-            hy2_config("name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\nport: 443\npassword: ''\n");
-        let Err(err) = parse_proxy(&cfg) else {
-            panic!("must hard-error");
-        };
-        assert!(err.contains("password must not be empty"), "msg: {err}");
     }
 
     #[cfg(feature = "hysteria2")]
@@ -2653,58 +2686,6 @@ tls: true
         assert_eq!(parse_hy2_bandwidth("8 MBps").unwrap(), 8_000_000);
         assert_eq!(parse_hy2_bandwidth("10").unwrap(), 1_250_000);
         assert_eq!(parse_hy2_bandwidth("").unwrap(), 0);
-    }
-
-    #[cfg(feature = "hysteria2")]
-    #[test]
-    fn parse_hysteria2_rejects_gecko_obfs() {
-        let cfg = hy2_config(
-            "name: jp-hy2\n\
-             type: hysteria2\n\
-             server: 1.2.3.4\n\
-             port: 443\n\
-             password: secret\n\
-             obfs: gecko\n\
-             obfs-password: secret\n",
-        );
-        let Err(err) = parse_proxy(&cfg) else {
-            panic!("must hard-error");
-        };
-        assert!(err.contains("gecko"), "msg: {err}");
-    }
-
-    #[cfg(feature = "hysteria2")]
-    #[test]
-    fn parse_hysteria2_rejects_obfs_without_password() {
-        let cfg = hy2_config(
-            "name: jp-hy2\n\
-             type: hysteria2\n\
-             server: 1.2.3.4\n\
-             port: 443\n\
-             password: secret\n\
-             obfs: salamander\n",
-        );
-        let Err(err) = parse_proxy(&cfg) else {
-            panic!("must hard-error");
-        };
-        assert!(err.contains("missing obfs-password"), "msg: {err}");
-    }
-
-    #[cfg(feature = "hysteria2")]
-    #[test]
-    fn parse_hysteria2_rejects_unsupported_mtls() {
-        let cfg = hy2_config(
-            "name: jp-hy2\n\
-             type: hysteria2\n\
-             server: 1.2.3.4\n\
-             port: 443\n\
-             password: secret\n\
-             certificate: ./client.crt\n",
-        );
-        let Err(err) = parse_proxy(&cfg) else {
-            panic!("must hard-error");
-        };
-        assert!(err.contains("certificate"), "msg: {err}");
     }
 
     #[cfg(feature = "hysteria2")]
@@ -3001,52 +2982,53 @@ tls: true
 
     #[cfg(feature = "snell")]
     #[test]
-    fn parse_snell_missing_psk() {
-        let cfg = snell_config("name: sn\ntype: snell\nserver: 1.2.3.4\nport: 8388\n");
-        let Err(err) = parse_proxy(&cfg) else {
-            panic!("missing psk must hard-error (Class A)");
-        };
-        assert!(err.contains("missing psk"), "msg: {err}");
-    }
+    fn parse_snell_rejects_invalid_fields() {
+        // (label, yaml, expected error substring). Every row is a Class A hard
+        // error: a required field is missing or invalid, and parsing must fail
+        // with a message naming that field.
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "missing psk",
+                "name: sn\ntype: snell\nserver: 1.2.3.4\nport: 8388\n",
+                "missing psk",
+            ),
+            (
+                "missing server",
+                "name: sn\ntype: snell\nport: 8388\npsk: secret\n",
+                "missing server",
+            ),
+            (
+                "missing port",
+                "name: sn\ntype: snell\nserver: 1.2.3.4\npsk: secret\n",
+                "missing port",
+            ),
+            (
+                "port zero",
+                "name: sn\ntype: snell\nserver: 1.2.3.4\nport: 0\npsk: secret\n",
+                "port must be non-zero",
+            ),
+            (
+                "empty psk (caught by SnellAdapter::new)",
+                "name: sn\ntype: snell\nserver: 1.2.3.4\nport: 8388\npsk: ''\n",
+                "psk must not be empty",
+            ),
+        ];
 
-    #[cfg(feature = "snell")]
-    #[test]
-    fn parse_snell_missing_server() {
-        let cfg = snell_config("name: sn\ntype: snell\nport: 8388\npsk: secret\n");
-        let Err(err) = parse_proxy(&cfg) else {
-            panic!("missing server must hard-error (Class A)");
-        };
-        assert!(err.contains("missing server"), "msg: {err}");
-    }
-
-    #[cfg(feature = "snell")]
-    #[test]
-    fn parse_snell_missing_port() {
-        let cfg = snell_config("name: sn\ntype: snell\nserver: 1.2.3.4\npsk: secret\n");
-        let Err(err) = parse_proxy(&cfg) else {
-            panic!("missing port must hard-error (Class A)");
-        };
-        assert!(err.contains("missing port"), "msg: {err}");
-    }
-
-    #[cfg(feature = "snell")]
-    #[test]
-    fn parse_snell_rejects_port_zero() {
-        let cfg = snell_config("name: sn\ntype: snell\nserver: 1.2.3.4\nport: 0\npsk: secret\n");
-        let Err(err) = parse_proxy(&cfg) else {
-            panic!("port 0 must hard-error (Class A)");
-        };
-        assert!(err.contains("port must be non-zero"), "msg: {err}");
-    }
-
-    #[cfg(feature = "snell")]
-    #[test]
-    fn parse_snell_rejects_empty_psk() {
-        let cfg = snell_config("name: sn\ntype: snell\nserver: 1.2.3.4\nport: 8388\npsk: ''\n");
-        let Err(err) = parse_proxy(&cfg) else {
-            panic!("empty psk must hard-error (Class A)");
-        };
-        assert!(err.contains("psk must not be empty"), "msg: {err}");
+        // Collect every failure instead of asserting inline so one bad row does
+        // not mask the rest of the table.
+        let mut failures: Vec<String> = Vec::new();
+        for &(label, yaml, expected) in cases {
+            match parse_proxy(&snell_config(yaml)) {
+                Ok(_) => failures.push(format!("[{label}] must hard-error (Class A), got Ok")),
+                Err(err) if !err.contains(expected) => {
+                    failures.push(format!(
+                        "[{label}] error must contain {expected:?}, got: {err}"
+                    ));
+                }
+                Err(_) => {}
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     #[cfg(feature = "snell")]
