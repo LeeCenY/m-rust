@@ -136,7 +136,12 @@ pub struct H2Stream {
     /// one) clears it, because after `Ready(Ok(n))` the caller may legally
     /// submit a different buffer (issue #423).  Only granted capacity is
     /// ever handed to the connection, so a peer that stops reading applies
-    /// real backpressure instead of growing h2's internal buffer.
+    /// real backpressure instead of growing h2's internal buffer.  A
+    /// payload still stashed at half-close (the parked write was cancelled)
+    /// is flushed together with the closing EOS frame by
+    /// [`Self::best_effort_eos`], never discarded; that flush is the one
+    /// place bytes reach h2 beyond the granted window, and [`WRITE_STASH_CAP`]
+    /// bounds it to a single capped stash.
     pending_write: Option<Bytes>,
     remote_no_error_is_eof: bool,
     eos_sent: bool,
@@ -162,7 +167,18 @@ impl H2Stream {
     fn best_effort_eos(&mut self) {
         if !self.eos_sent {
             self.eos_sent = true;
-            let _ = self.send.send_data(Bytes::new(), true);
+            // Flush any payload stashed by a write cancelled at its Pending
+            // await before half-closing — sending an empty EOS over it would
+            // silently truncate the stream (mirrors GunStream::poll_shutdown
+            // in grpc.rs).  Only a cancelled write leaves `pending_write`
+            // set: the changed-buffer guard clears it before returning
+            // `InvalidInput`, so this never resurrects rejected bytes.
+            // `send_data` queues beyond the granted flow-control window
+            // inside h2, so this stays a single non-blocking best-effort
+            // call, bounded to one stashed payload (at most
+            // `WRITE_STASH_CAP` bytes).
+            let data = self.pending_write.take().unwrap_or_default();
+            let _ = self.send.send_data(data, true);
         }
     }
 }
@@ -550,6 +566,183 @@ mod tests {
             .await
             .expect("server must finish draining")
             .expect("server task");
+    }
+
+    /// Open one client stream against a server that accepts the request,
+    /// responds 200, and then *hoards* request-body flow-control capacity:
+    /// it consumes DATA frames without releasing the receive window until
+    /// the returned release sender fires, after which it drains the body to
+    /// end-of-stream and hands the collected bytes back through the returned
+    /// receiver.  Keeping the window shut parks `poll_write` in the
+    /// `Pending` + stashed-payload state.
+    async fn hoarding_h2_stream() -> (
+        H2Stream,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<Vec<u8>>,
+    ) {
+        let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+        let (release_tx, mut release_rx) = tokio::sync::oneshot::channel::<()>();
+        let (body_tx, body_rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
+
+        tokio::spawn(async move {
+            let Ok(mut conn) = h2::server::handshake(server_io).await else {
+                return;
+            };
+            let Some(Ok((request, mut respond))) = conn.accept().await else {
+                return;
+            };
+            // Drive connection-level frames in the background.
+            tokio::spawn(async move { while conn.accept().await.is_some() {} });
+            let _ = respond.send_response(http::Response::new(()), false);
+
+            let mut body = request.into_body();
+            let mut received = Vec::new();
+            // Hoard: consume DATA but never release capacity, so the
+            // client's send window (65535 initial) empties and stays empty.
+            loop {
+                tokio::select! {
+                    chunk = body.data() => match chunk {
+                        Some(Ok(chunk)) => received.extend_from_slice(&chunk),
+                        Some(Err(_)) => return, // reset — client went away
+                        None => {
+                            let _ = body_tx.send(received);
+                            return;
+                        }
+                    },
+                    _ = &mut release_rx => break,
+                }
+            }
+            // Reopen the window, then drain to end-of-stream.
+            let _ = body.flow_control().release_capacity(received.len());
+            loop {
+                match body.data().await {
+                    Some(Ok(chunk)) => {
+                        let _ = body.flow_control().release_capacity(chunk.len());
+                        received.extend_from_slice(&chunk);
+                    }
+                    Some(Err(_)) => return,
+                    None => {
+                        let _ = body_tx.send(received);
+                        return;
+                    }
+                }
+            }
+        });
+
+        let (send_request, connection) = h2::client::handshake(client_io)
+            .await
+            .expect("client handshake");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let request = http::Request::builder()
+            .method(http::Method::POST)
+            .uri("https://localhost")
+            .body(())
+            .expect("static request");
+        let mut send_request = send_request.ready().await.expect("send_request ready");
+        let (response, send_stream) = send_request
+            .send_request(request, false)
+            .expect("send_request");
+
+        (
+            H2Stream::new(send_stream, RecvState::new(response)),
+            release_tx,
+            body_rx,
+        )
+    }
+
+    /// Drive writes against `stream` until exactly `payload.len()` bytes have
+    /// been accepted (the h2 window may grant capacity piecemeal).
+    async fn write_all_yielding(stream: &mut H2Stream, payload: &[u8]) {
+        let mut sent = 0;
+        while sent < payload.len() {
+            match poll_write_once(stream, &payload[sent..]).await {
+                // Capacity not assigned yet — let the connection task run.
+                None => tokio::task::yield_now().await,
+                Some(Ok(n)) => sent += n,
+                Some(Err(error)) => panic!("window-filling write failed: {error}"),
+            }
+        }
+    }
+
+    /// `poll_shutdown` must flush a payload stashed by a cancelled write
+    /// together with the closing EOS frame instead of silently discarding it
+    /// behind an empty DATA+EOS (follow-up to the #440 review; mirrors
+    /// `grpc_shutdown_flushes_stashed_frame_before_eos` for GunStream).
+    #[tokio::test]
+    async fn shutdown_flushes_stashed_pending_write() {
+        let (mut stream, release_tx, body_rx) = hoarding_h2_stream().await;
+
+        // Exhaust the 65535-byte initial send window…
+        let fill = vec![b'a'; 65535];
+        write_all_yielding(&mut stream, &fill).await;
+
+        // …so this write parks on flow control with its payload stashed.
+        let tail = b"tail-after-cancelled-write";
+        assert!(
+            poll_write_once(&mut stream, tail).await.is_none(),
+            "tail write must park on flow control"
+        );
+        assert!(stream.pending_write.is_some(), "payload must be stashed");
+
+        // The parked write is never retried (cancellation); shutdown must
+        // flush the stashed payload, not drop it.
+        stream.shutdown().await.expect("shutdown");
+        assert!(
+            stream.pending_write.is_none(),
+            "shutdown must consume the stashed payload"
+        );
+
+        release_tx.send(()).expect("server task alive");
+        let received = tokio::time::timeout(Duration::from_secs(5), body_rx)
+            .await
+            .expect("server must observe end-of-stream")
+            .expect("server sent collected body");
+
+        let mut expected = fill;
+        expected.extend_from_slice(tail);
+        assert_eq!(
+            received, expected,
+            "stashed payload must be delivered before EOS"
+        );
+    }
+
+    /// Companion: a payload cleared by the changed-buffer `InvalidInput`
+    /// rejection must NOT be resurrected by a later shutdown — only a frame
+    /// stashed by a cancelled write gets flushed.
+    #[tokio::test]
+    async fn shutdown_after_rejected_buffer_does_not_resurrect_payload() {
+        let (mut stream, release_tx, body_rx) = hoarding_h2_stream().await;
+
+        let fill = vec![b'a'; 65535];
+        write_all_yielding(&mut stream, &fill).await;
+
+        assert!(
+            poll_write_once(&mut stream, b"stashed-then-rejected")
+                .await
+                .is_none(),
+            "write must park on flow control"
+        );
+
+        // Retrying with a different buffer trips the guard and clears the
+        // stash.
+        let error = match poll_write_once(&mut stream, b"different-buffer").await {
+            Some(Err(error)) => error,
+            other => panic!("changed buffer after Pending must be rejected, got {other:?}"),
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+        stream.shutdown().await.expect("shutdown");
+        release_tx.send(()).expect("server task alive");
+        let received = tokio::time::timeout(Duration::from_secs(5), body_rx)
+            .await
+            .expect("server must observe end-of-stream")
+            .expect("server sent collected body");
+        assert_eq!(
+            received, fill,
+            "a payload cleared by the changed-buffer rejection must not reappear at shutdown"
+        );
     }
 
     /// Dropping an `H2Stream` half-closes the request body with a clean
