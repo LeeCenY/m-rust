@@ -1108,88 +1108,64 @@ proxies:
     );
 }
 
-/// D16j: sing-mux on VMess → accepted (default h2mux).
+/// D16j / D16j2 / D16k: VMess mux blocks that must load with no mux warn.
+///
+/// * D16j  — sing-mux via the legacy `mux:` alias (default protocol h2mux).
+/// * D16j2 — the canonical mihomo `smux:` key (same block as the legacy alias).
+/// * D16k  — `protocol: muxcool`: CommandMux 0x03 is the VMess request
+///   header's native mux signaling; sing-vmess routes it to
+///   `HandleMuxConnection`.
+///
+/// Every case runs even if an earlier one fails; failures are reported
+/// together with their label.
 #[cfg(all(feature = "mux", feature = "vmess"))]
 #[tokio::test]
-async fn parse_vmess_mux_singmux_accepted() {
-    let yaml = r#"
-proxies:
-  - name: m
-    type: vmess
-    server: example.com
-    port: 443
-    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
-    cipher: auto
-    mux:
-      enabled: true
-"#;
-    let (result, lines) = with_warn_capture_async(load_config_from_str(yaml)).await;
-    let config = result.expect("vmess mux must load");
-    assert!(config.proxies.contains_key("m"), "vmess proxy must be kept");
-    let mux_warns = lines
-        .iter()
-        .filter(|l| l.contains("WARN") && l.to_lowercase().contains("mux"))
-        .count();
-    assert_eq!(
-        mux_warns, 0,
-        "vmess sing-mux is implemented: no warn expected"
-    );
-}
+async fn parse_vmess_mux_protocol_table() {
+    const CASES: &[(&str, &str)] = &[
+        (
+            "D16j: sing-mux via the legacy `mux:` alias (default h2mux)",
+            "    mux:\n      enabled: true\n",
+        ),
+        (
+            "D16j2: the canonical mihomo `smux:` key",
+            "    smux:\n      enabled: true\n",
+        ),
+        (
+            "D16k: `protocol: muxcool` (VMess CommandMux 0x03)",
+            "    mux:\n      enabled: true\n      protocol: muxcool\n",
+        ),
+    ];
 
-/// D16j2: the canonical mihomo `smux:` key on VMess → accepted
-/// (same block as the legacy `mux:` alias, which stays covered above).
-#[cfg(all(feature = "mux", feature = "vmess"))]
-#[tokio::test]
-async fn parse_vmess_smux_key_accepted() {
-    let yaml = r#"
-proxies:
-  - name: m
-    type: vmess
-    server: example.com
-    port: 443
-    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
-    cipher: auto
-    smux:
-      enabled: true
-"#;
-    let (result, lines) = with_warn_capture_async(load_config_from_str(yaml)).await;
-    let config = result.expect("vmess smux: must load");
-    assert!(config.proxies.contains_key("m"), "vmess proxy must be kept");
-    let mux_warns = lines
-        .iter()
-        .filter(|l| l.contains("WARN") && l.to_lowercase().contains("mux"))
-        .count();
-    assert_eq!(mux_warns, 0, "smux: key is canonical: no warn expected");
-}
-
-/// D16k: `protocol: muxcool` on VMess → accepted (CommandMux 0x03 is the
-/// VMess request header's native mux signaling; sing-vmess routes it to
-/// HandleMuxConnection).
-#[cfg(all(feature = "mux", feature = "vmess"))]
-#[tokio::test]
-async fn parse_vmess_mux_muxcool_accepted() {
-    let yaml = r#"
-proxies:
-  - name: m
-    type: vmess
-    server: example.com
-    port: 443
-    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
-    cipher: auto
-    mux:
-      enabled: true
-      protocol: muxcool
-"#;
-    let (result, lines) = with_warn_capture_async(load_config_from_str(yaml)).await;
-    let config = result.expect("vmess muxcool must load");
-    assert!(config.proxies.contains_key("m"), "vmess proxy must be kept");
-    let mux_warns = lines
-        .iter()
-        .filter(|l| l.contains("WARN") && l.to_lowercase().contains("mux"))
-        .count();
-    assert_eq!(
-        mux_warns, 0,
-        "vmess muxcool is implemented: no warn expected"
+    let mut failures: Vec<String> = Vec::new();
+    for (label, mux_block) in CASES {
+        let yaml = format!(
+            "proxies:\n  - name: m\n    type: vmess\n    server: example.com\n    \
+             port: 443\n    uuid: b831381d-6324-4d53-ad4f-8cda48b30811\n    \
+             cipher: auto\n{mux_block}"
+        );
+        let (result, lines) = with_warn_capture_async(load_config_from_str(&yaml)).await;
+        match result {
+            Err(e) => failures.push(format!("{label}: config must load, got error: {e}")),
+            Ok(config) => {
+                if !config.proxies.contains_key("m") {
+                    failures.push(format!("{label}: vmess proxy must be kept; {lines:?}"));
+                }
+                let mux_warns = lines
+                    .iter()
+                    .filter(|l| l.contains("WARN") && l.to_lowercase().contains("mux"))
+                    .count();
+                if mux_warns != 0 {
+                    failures.push(format!(
+                        "{label}: implemented, no mux warn expected, got {mux_warns}; {lines:?}"
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "vmess mux cases failed:\n{}",
+        failures.join("\n")
     );
 }
 

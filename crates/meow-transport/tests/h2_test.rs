@@ -30,20 +30,20 @@ use support::h2_stalled::{stalled_h2_parts, STALLED_PAYLOAD_LEN};
 use support::loopback::{spawn_h2_server, spawn_h2_server_deferred_response};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-async fn assert_h2_config_error(config: H2Config, expected: &str) {
+async fn assert_h2_config_error(case: &str, config: H2Config, expected: &str) {
     let (client, _server) = tokio::io::duplex(64);
     let layer = H2Layer::new(config);
     let Err(err) = layer.connect(Box::new(client)).await else {
-        panic!("invalid h2 config unexpectedly connected");
+        panic!("[{case}] invalid h2 config unexpectedly connected");
     };
     match err {
         TransportError::Config(msg) => {
             assert!(
                 msg.contains(expected),
-                "expected config error containing {expected:?}, got: {msg}"
+                "[{case}] expected config error containing {expected:?}, got: {msg}"
             );
         }
-        other => panic!("expected TransportError::Config, got: {other:?}"),
+        other => panic!("[{case}] expected TransportError::Config, got: {other:?}"),
     }
 }
 
@@ -211,37 +211,40 @@ async fn h2_path_forwarded() {
     );
 }
 
+/// Config validation rejects bad `H2Config` before any handshake bytes are
+/// written: empty host list, CRLF injection in `path`, and an invalid host.
 #[tokio::test]
-async fn h2_rejects_empty_hosts_before_handshake() {
-    assert_h2_config_error(
-        H2Config {
-            path: "/".into(),
-            hosts: vec![],
-        },
-        "hosts",
-    )
-    .await;
-}
+async fn h2_rejects_invalid_config_table() {
+    let cases: [(&str, H2Config, &str); 3] = [
+        (
+            "empty hosts",
+            H2Config {
+                path: "/".into(),
+                hosts: vec![],
+            },
+            "hosts",
+        ),
+        (
+            "crlf injection in path",
+            H2Config {
+                path: "/ok\r\nx: y".into(),
+                hosts: vec!["example.com".into()],
+            },
+            "invalid request config",
+        ),
+        (
+            "invalid host with space",
+            H2Config {
+                path: "/".into(),
+                hosts: vec!["bad host".into()],
+            },
+            "invalid request config",
+        ),
+    ];
 
-#[tokio::test]
-async fn h2_rejects_invalid_request_config_before_handshake() {
-    assert_h2_config_error(
-        H2Config {
-            path: "/ok\r\nx: y".into(),
-            hosts: vec!["example.com".into()],
-        },
-        "invalid request config",
-    )
-    .await;
-
-    assert_h2_config_error(
-        H2Config {
-            path: "/".into(),
-            hosts: vec!["bad host".into()],
-        },
-        "invalid request config",
-    )
-    .await;
+    for (case, config, expected) in cases {
+        assert_h2_config_error(case, config, expected).await;
+    }
 }
 
 // ─── D5: Response HEADERS withheld until the first client DATA frame ──────────
