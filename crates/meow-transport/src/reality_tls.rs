@@ -52,14 +52,26 @@ const GROUP_X25519: u16 = 0x001d;
 // legitimate flight cannot come close to either limit below. Mirrors
 // `MAX_GUN_FRAME_LEN` in `grpc.rs` and the size caps in `ws.rs`.
 //
-// Note these two constants are defense-in-depth, not the load-bearing
-// bound: that is `ServerFlightGuard`'s flight-ordering check, which admits
-// at most 3 messages (EncryptedExtensions / Certificate / CertificateVerify,
-// each exactly once, in order) of ~36 KiB each — a message must complete
-// within one 18 KiB record plus whatever partial tail the previous record
-// left buffered, or `pop_handshake_message` fails the loop. Changes to the
-// per-message size math must keep that guard intact; the caps below only
-// backstop it against future refactors.
+// The two constants below are not equally load-bearing, and it matters
+// which is which when the size math changes.
+//
+// `ServerFlightGuard`'s flight-ordering check admits at most 3 messages
+// (EncryptedExtensions / Certificate / CertificateVerify, each exactly once,
+// in order), each at most ~36 KiB — a message must complete within one
+// 18 KiB record plus whatever partial tail the previous record left
+// buffered, or `pop_handshake_message` fails the loop.
+//
+// `MAX_PRE_AUTH_HS_MESSAGES` (32) is therefore pure defense-in-depth: the
+// ordering guard caps the count at 3, so 32 is unreachable while that guard
+// holds.
+//
+// `MAX_PRE_AUTH_TRANSCRIPT_LEN` (64 KiB) is *not* — it is the binding limit
+// on a large flight. At ~36 KiB per message, two messages already exceed
+// 64 KiB, so the transcript check in `ServerFlightGuard::admit` is what
+// actually rejects an oversized Certificate flight, before the message
+// count ever reaches 3. Treat it as a real bound: raising the per-message
+// size or the record cap without revisiting it changes what this code
+// accepts pre-authentication.
 const MAX_PRE_AUTH_HS_MESSAGES: usize = 32;
 const MAX_PRE_AUTH_TRANSCRIPT_LEN: usize = 64 * 1024;
 
