@@ -235,7 +235,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let got = resolve_contained_impl(dir.path(), Path::new("/etc/cron.d/pwned"), true)
             .expect("skip=true must allow the out-of-root path");
-        assert_eq!(got, PathBuf::from("/etc/cron.d/pwned"));
+        // `/etc/...` is root-relative rather than absolute on Windows (no
+        // drive prefix), so the impl anchors it on the base's drive and the
+        // result is `C:\etc\cron.d\pwned`. Assert on the properties that
+        // matter on every platform: the requested path came back intact, and
+        // it really does sit outside the base. Join the suffix so the
+        // comparison is component-wise with native separators.
+        assert!(
+            got.ends_with(Path::new("etc").join("cron.d").join("pwned")),
+            "unexpected: {}",
+            got.display()
+        );
+        assert!(
+            !got.starts_with(normalize_absolute(dir.path()).unwrap()),
+            "must have escaped the base: {}",
+            got.display()
+        );
         // Traversal is still lexically normalized before being handed back.
         let got = resolve_contained_impl(dir.path(), Path::new("sub/../../outside"), true).unwrap();
         assert!(!got.to_string_lossy().contains(".."));
