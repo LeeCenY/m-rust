@@ -59,6 +59,7 @@ struct SsCore {
     server_config: ServerConfig,
     context: shadowsocks::context::SharedContext,
     plugin: PluginKind,
+    dialer: Arc<dyn crate::dialer::TcpDialer>,
 }
 
 pub struct ShadowsocksAdapter {
@@ -83,6 +84,7 @@ impl ShadowsocksAdapter {
         udp: bool,
         plugin_name: Option<&str>,
         plugin_opts: Option<&str>,
+        dialer: Arc<dyn crate::dialer::TcpDialer>,
     ) -> Result<Self> {
         let cipher_kind = cipher
             .parse::<CipherKind>()
@@ -156,6 +158,7 @@ impl ShadowsocksAdapter {
             server_config,
             context,
             plugin,
+            dialer,
         });
 
         Ok(Self {
@@ -202,10 +205,12 @@ impl SsCore {
             PluginKind::Obfs(obfs) => {
                 // Open a raw TCP connection to the SS server, wrap it in the
                 // simple-obfs codec, then layer the SS crypto stream on top.
-                let tcp = meow_common::connect_tcp_host(&self.server, self.port)
+                let tcp = self
+                    .dialer
+                    .dial(&self.server, self.port)
                     .await
                     .map_err(|e| MeowError::Proxy(format!("ss obfs tcp connect: {e}")))?;
-                let _ = tcp.set_nodelay(true);
+
                 match obfs.clone() {
                     BuiltinObfs::Http { host } => {
                         let wrapped = HttpObfs::new(tcp, host, self.port);
@@ -231,7 +236,8 @@ impl SsCore {
             }
             PluginKind::V2ray(cfg, tls) => {
                 let transport =
-                    v2ray_plugin::dial(cfg, tls.as_ref(), &self.server, self.port).await?;
+                    v2ray_plugin::dial(cfg, tls.as_ref(), &self.server, self.port, &*self.dialer)
+                        .await?;
                 let stream = ProxyClientStream::from_stream(
                     Arc::clone(&self.context),
                     transport,
@@ -242,7 +248,8 @@ impl SsCore {
             }
             #[cfg(feature = "ech-tls-tunnel")]
             PluginKind::EchTlsTunnel(cfg, tls) => {
-                let transport = ech_tls_tunnel::dial(cfg, tls, &self.server, self.port).await?;
+                let transport =
+                    ech_tls_tunnel::dial(cfg, tls, &self.server, self.port, &*self.dialer).await?;
                 let stream = ProxyClientStream::from_stream(
                     Arc::clone(&self.context),
                     transport,
@@ -251,28 +258,37 @@ impl SsCore {
                 );
                 Ok(Box::new(SsConn(stream)))
             }
-            PluginKind::None | PluginKind::External(_) => {
-                // Hand-roll the TCP connect so the installed
-                // `meow_common::SocketProtector` sees the fd before connect —
-                // otherwise the upstream `shadowsocks` crate would dial this
-                // stream internally via plain tokio and the Android
-                // `VpnService.protect(fd)` hook would never fire, so the
-                // outbound socket would loop back into our own VPN tunnel.
-                //
-                // For `PluginKind::External`, `tcp_external_addr` returns the
-                // SIP003 plugin's local listener (typically 127.0.0.1:<port>),
-                // so the connect is loopback and `protect()` is harmless;
-                // for `PluginKind::None` it's the remote SS server. Dispatch
-                // on the variant so domain-name servers also go through the
-                // installed `HostResolver` (system DNS would loop the
-                // lookup through the VPN on Android).
+            PluginKind::None => {
+                // Dial the remote SS server through the pluggable dialer
+                // (direct or via ``dialer-proxy``).  ``connect_tcp_host`` is
+                // resolver-aware and SocketProtector-aware (Android
+                // ``VpnService.protect(fd)``), and ``DirectDialer`` preserves
+                // both of those properties.
+                let tcp = match self.server_config.tcp_external_addr() {
+                    ServerAddr::SocketAddr(sa) => self.dialer.dial_addr(*sa).await,
+                    ServerAddr::DomainName(host, port) => self.dialer.dial(host, *port).await,
+                }
+                .map_err(|e| MeowError::Proxy(format!("ss tcp connect: {e}")))?;
+                let stream = ProxyClientStream::from_stream(
+                    Arc::clone(&self.context),
+                    tcp,
+                    &self.server_config,
+                    addr,
+                );
+                Ok(Box::new(SsConn(stream)))
+            }
+            PluginKind::External(_) => {
+                // SIP003 plugin subprocess: ``tcp_external_addr`` returns the
+                // plugin's local listener (typically 127.0.0.1:<port>).
+                // Always dial directly — the plugin is a local process and
+                // must NOT be tunnelled through ``dialer-proxy``.
                 let tcp = match self.server_config.tcp_external_addr() {
                     ServerAddr::SocketAddr(sa) => meow_common::connect_tcp(*sa).await,
                     ServerAddr::DomainName(host, port) => {
                         meow_common::connect_tcp_host(host, *port).await
                     }
                 }
-                .map_err(|e| MeowError::Proxy(format!("ss tcp connect: {e}")))?;
+                .map_err(|e| MeowError::Proxy(format!("ss plugin tcp connect: {e}")))?;
                 let stream = ProxyClientStream::from_stream(
                     Arc::clone(&self.context),
                     tcp,
@@ -501,10 +517,19 @@ impl ProxyAdapter for ShadowsocksAdapter {
     }
 
     fn support_udp(&self) -> bool {
-        // With mux enabled, UDP rides the mux TCP session (unless
-        // `only-tcp` forces the plain path) — mirrors mihomo's
-        // SingMux.SupportUDP.
-        self.support_udp || {
+        // SS UDP relay uses a raw UDP socket that bypasses the TCP dialer.
+        // When a `ProxyDialer` is installed (dialer-proxy), raw UDP would
+        // leak traffic past the chain — advertise the plain UDP path as
+        // unsupported.  Mux UDP is safe because it rides the mux TCP session
+        // through `dialer.dial()`, so it is unaffected.
+        //
+        // This is the *advertised* capability only (LoadBalance member
+        // filtering, the `udp` field in `GET /proxies`).  It is NOT the
+        // enforcement point: `meow-tunnel`'s UDP path calls `dial_udp`
+        // directly without consulting `support_udp`, so the refusal is
+        // re-checked there.  Keep the two in sync.
+        let plain_udp_ok = self.support_udp && !self.core.dialer.is_proxy();
+        plain_udp_ok || {
             #[cfg(feature = "mux")]
             {
                 self.mux.as_ref().is_some_and(|mux| mux.supports_udp())
@@ -543,6 +568,23 @@ impl ProxyAdapter for ShadowsocksAdapter {
             if let Some(conn) = mux.open_packet_stream_for(metadata, "ss").await? {
                 return Ok(conn);
             }
+        }
+
+        // Enforcement point for the dialer-proxy UDP leak (not `support_udp`,
+        // which the tunnel's UDP dispatch never consults).  The plain SS UDP
+        // relay below binds a raw socket and connects straight to the SS
+        // server, so with a `ProxyDialer` installed it would egress from the
+        // real source path while TCP goes through the front proxy.  Refuse
+        // loudly (Class A, ADR-0002) instead of leaking.  Reached only after
+        // the mux branch above, which tunnels UDP over `dialer.dial()` and is
+        // therefore safe.
+        if self.core.dialer.is_proxy() {
+            return Err(MeowError::NotSupported(
+                "ss: plain UDP relay bypasses `dialer-proxy` (raw socket); \
+                 refusing to leak the real source path — enable `smux`/`yamux` \
+                 mux for UDP over the chain"
+                    .into(),
+            ));
         }
 
         if matches!(self.core.plugin, PluginKind::V2ray(..)) {
@@ -726,6 +768,76 @@ mod tests {
             "non-transport mode must not change Mode"
         );
         assert_eq!(o.as_deref(), Some("mode=quic;host=a.com"));
+    }
+
+    /// A dialer that reports itself as proxied without needing a real front
+    /// proxy — stands in for `ProxyDialer` in the leak-refusal tests.
+    struct FakeProxyDialer;
+
+    #[async_trait]
+    impl crate::dialer::TcpDialer for FakeProxyDialer {
+        async fn dial(
+            &self,
+            _host: &str,
+            _port: u16,
+        ) -> std::io::Result<Box<dyn meow_transport::Stream>> {
+            Err(std::io::Error::other("test dialer never connects"))
+        }
+
+        fn is_proxy(&self) -> bool {
+            true
+        }
+    }
+
+    fn ss_adapter(udp: bool, dialer: Arc<dyn crate::dialer::TcpDialer>) -> ShadowsocksAdapter {
+        ShadowsocksAdapter::new(
+            "ss-test",
+            "127.0.0.1",
+            8388,
+            "password",
+            "aes-256-gcm",
+            udp,
+            None,
+            None,
+            dialer,
+        )
+        .expect("adapter builds")
+    }
+
+    /// Regression: the plain SS UDP relay binds a raw socket and connects
+    /// straight to the SS server, bypassing the TCP dialer. With a proxy dialer
+    /// installed it must refuse, not egress from the real source path.
+    ///
+    /// `dial_udp` is the enforcement point on purpose: the tunnel's UDP
+    /// dispatch (`meow-tunnel/src/udp.rs`) calls it directly and never consults
+    /// `support_udp()`, so gating only the latter would leave the leak open for
+    /// any rule that references the outbound by name.
+    #[tokio::test]
+    async fn plain_udp_is_refused_under_proxy_dialer() {
+        let adapter = ss_adapter(true, Arc::new(FakeProxyDialer));
+
+        // `ProxyPacketConn` is not `Debug`, so match rather than `expect_err`.
+        match adapter.dial_udp(&Metadata::default()).await {
+            Err(MeowError::NotSupported(m)) => assert!(
+                m.contains("dialer-proxy"),
+                "refusal should name dialer-proxy, got: {m}"
+            ),
+            Err(other) => panic!("expected NotSupported, got: {other:?}"),
+            Ok(_) => panic!("plain UDP must be refused under a proxy dialer"),
+        }
+
+        assert!(
+            !adapter.support_udp(),
+            "advertised capability must agree with the refusal"
+        );
+    }
+
+    /// The same adapter with the default direct dialer keeps advertising UDP —
+    /// the guard must not regress the non-chained path.
+    #[test]
+    fn plain_udp_still_advertised_under_direct_dialer() {
+        assert!(ss_adapter(true, Arc::new(crate::dialer::DirectDialer)).support_udp());
+        assert!(!ss_adapter(false, Arc::new(crate::dialer::DirectDialer)).support_udp());
     }
 
     #[test]
