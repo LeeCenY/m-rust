@@ -33,15 +33,16 @@ pub async fn parse_dns(
         _ => {
             let hosts = build_hosts_trie(raw.hosts.as_ref())?;
             let use_hosts = raw.dns.as_ref().and_then(|d| d.use_hosts).unwrap_or(true);
-            let resolver = Arc::new(Resolver::new(
+            let resolver = Resolver::new(
                 vec!["8.8.8.8:53".parse().unwrap()],
                 vec![],
                 DnsMode::Normal,
                 hosts,
                 use_hosts,
-            ));
+                crate::effective_ipv6(raw.ipv6),
+            );
             return Ok(DnsConfig {
-                resolver,
+                resolver: Arc::new(resolver),
                 listen_addr: None,
                 enabled: false,
                 proxy_resolver: None,
@@ -103,6 +104,7 @@ pub async fn parse_dns(
                 DnsMode::Normal,
                 proxy_hosts,
                 use_hosts,
+                crate::effective_ipv6(raw.ipv6),
                 None,
                 None,
                 proxy_registry,
@@ -155,6 +157,7 @@ pub async fn parse_dns(
         mode,
         hosts,
         use_hosts,
+        crate::effective_ipv6(raw.ipv6),
         policy,
         fallback_filter,
         proxy_registry,

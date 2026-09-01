@@ -91,6 +91,20 @@ pub struct GeneralConfig {
     pub bind_address: String,
 }
 
+/// Single source of truth for the effective `ipv6` setting of a config
+/// whose `ipv6:` key is unset. The literal was previously scattered
+/// across six `unwrap_or(...)` call sites (review), which is how the
+/// parser and `GET /configs` ended up disagreeing in the first place.
+///
+/// Defaults to **`false`**, matching Go mihomo / Clash: an operator must
+/// opt in to IPv6 resolution explicitly. (The temporary flip to `true`
+/// was reverted to stay consistent with the upstream ecosystem; see the
+/// CHANGELOG.) When `false`, AAAA lookups are skipped and the resolver
+/// answers IPv4-only — set `ipv6: true` for dual-stack resolution.
+pub fn effective_ipv6(raw_ipv6: Option<bool>) -> bool {
+    raw_ipv6.unwrap_or(false)
+}
+
 pub struct DnsConfig {
     pub resolver: Arc<Resolver>,
     pub listen_addr: Option<SocketAddr>,
@@ -580,6 +594,7 @@ fn rebuild_from_raw_impl(
     shared_ctx: Option<&meow_rules::ParserContext>,
     prefetched_payloads: Option<&rule_provider::PrefetchedPayloads>,
 ) -> Result<RebuildResult, anyhow::Error> {
+    let ipv6 = effective_ipv6(raw.ipv6);
     let mut proxies: HashMap<SmolStr, Arc<dyn Proxy>> = HashMap::new();
     // Built-in proxies
     let mut direct = meow_proxy::DirectAdapter::new();
@@ -610,7 +625,7 @@ fn rebuild_from_raw_impl(
     );
 
     for raw_proxy in raw.proxies.as_deref().unwrap_or(&[]) {
-        match proxy_parser::parse_proxy(raw_proxy) {
+        match proxy_parser::parse_proxy(raw_proxy, ipv6) {
             Ok(proxy) => {
                 // Prefer the YAML `name:` as the registry key. `proxy.name()`
                 // is fine for SS/Trojan/VLESS (their parsers thread the name
@@ -832,12 +847,13 @@ async fn prefetch_rule_provider_payloads_async(
         return HashMap::new();
     };
     let raw_providers = raw_providers.clone();
+    let ipv6 = effective_ipv6(raw.ipv6);
     let raw_proxies: Vec<HashMap<String, serde_yaml::Value>> =
         raw.proxies.clone().unwrap_or_default();
     spawn_blocking_with_current_dispatcher(move || {
         let default_proxy: Option<Arc<dyn Proxy>> = raw_proxies
             .iter()
-            .find_map(|raw_proxy| proxy_parser::parse_proxy(raw_proxy).ok());
+            .find_map(|raw_proxy| proxy_parser::parse_proxy(raw_proxy, ipv6).ok());
         // Pre-registry `proxy:` resolution parses the named leaf out of the
         // raw `proxies:` block; group names don't resolve here, so their
         // providers skip prefetch and fetch during the registry-backed load.
@@ -845,7 +861,7 @@ async fn prefetch_rule_provider_payloads_async(
             raw_proxies
                 .iter()
                 .filter(|p| p.get("name").and_then(serde_yaml::Value::as_str) == Some(wanted))
-                .find_map(|raw_proxy| proxy_parser::parse_proxy(raw_proxy).ok())
+                .find_map(|raw_proxy| proxy_parser::parse_proxy(raw_proxy, ipv6).ok())
         };
         rule_provider::prefetch_payloads(
             &raw_providers,
@@ -1069,7 +1085,7 @@ async fn ensure_geodata(raw: &raw::RawConfig, geo: &GeoDataConfig, scan_lines: &
         .as_deref()
         .unwrap_or(&[])
         .iter()
-        .find_map(|raw_proxy| proxy_parser::parse_proxy(raw_proxy).ok());
+        .find_map(|raw_proxy| proxy_parser::parse_proxy(raw_proxy, effective_ipv6(raw.ipv6)).ok());
 
     let mut downloads = Vec::new();
     if geoip_missing {
@@ -1670,7 +1686,7 @@ async fn build_config(
     let general = GeneralConfig {
         mode,
         log_level,
-        ipv6: raw.ipv6.unwrap_or(false),
+        ipv6: effective_ipv6(raw.ipv6),
         allow_lan: raw.allow_lan.unwrap_or(false),
         bind_address,
     };
@@ -1680,7 +1696,7 @@ async fn build_config(
         if raw_pp.is_empty() {
             HashMap::new()
         } else {
-            proxy_provider::load_proxy_providers(raw_pp, cache_dir).await
+            proxy_provider::load_proxy_providers(raw_pp, cache_dir, general.ipv6).await
         }
     } else {
         HashMap::new()
