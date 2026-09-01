@@ -26,6 +26,10 @@ struct Args {
     #[arg(long, default_value = "target/release/meow")]
     rust_binary: PathBuf,
 
+    /// CLI flag the binary takes before the config path (meow: -f, xray: -c)
+    #[arg(long, default_value = "-f")]
+    binary_arg: String,
+
     /// Path to the Go mihomo binary (skip Go benchmarks if absent)
     #[arg(long)]
     go_binary: Option<PathBuf>,
@@ -129,6 +133,93 @@ async fn wait_for_udp_port(addr: SocketAddr, timeout: Duration) -> anyhow::Resul
     }
 }
 
+/// Grace period granted to a child between SIGTERM and the fallback
+/// SIGKILL (Unix only; Windows terminates the child directly).
+#[cfg_attr(not(unix), allow(dead_code))]
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+/// Stops a benchmark child process.  On Unix the child is asked to
+/// exit gracefully with SIGTERM and given a bounded grace period to
+/// finish before being killed; on Windows it is terminated directly
+/// (a no-op once the process already exited).
+async fn shutdown_child(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        // An already-exited child reports pid 0 and must not be
+        // signalled; `try_wait` also reaps it so the later `wait` is a
+        // no-op.
+        if let Ok(Some(_)) = child.try_wait() {
+            return;
+        }
+        let pid = child.id();
+        if pid != 0 {
+            let _ = Command::new("kill")
+                .args(["-TERM", &pid.to_string()])
+                .status();
+        }
+        let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return, // graceful exit within the grace period
+                Ok(None) => {}
+                Err(_) => break, // cannot wait (already reaped) — fall through
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Reaps a spawned proxy on drop — benchmark error paths must not leak
+/// the child process (its listener would hold the port and break the
+/// next target).  The success path calls [`ChildGuard::shutdown`],
+/// which stops the child and disarms the guard so that dropping it
+/// afterwards does not kill or wait again — unlike the former
+/// `std::mem::forget`, this does not leak the `Child` handle (a
+/// HANDLE on Windows).
+struct ChildGuard(Option<std::process::Child>);
+
+impl ChildGuard {
+    fn new(child: std::process::Child) -> Self {
+        Self(Some(child))
+    }
+
+    fn id(&self) -> u32 {
+        self.0.as_ref().map_or(0, std::process::Child::id)
+    }
+
+    /// Success-path shutdown: gracefully stop the child, then disarm
+    /// the guard so `Drop` is a no-op.
+    async fn shutdown(mut self) {
+        if let Some(child) = self.0.as_mut() {
+            shutdown_child(child).await;
+        }
+        self.0 = None;
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            // Error path only — the success path disarms via
+            // `shutdown()`. `kill()` precedes `wait()`, so the blocking
+            // reap returns almost immediately; std's `Child` has no
+            // async wait, so a brief block on an async worker is the
+            // accepted trade-off (review N6). Bounded worst case
+            // overall: a target that ignores SIGTERM costs up to
+            // `SHUTDOWN_GRACE` (5 s) in `shutdown_child`, and targets
+            // shut down sequentially, so a full multi-target run adds
+            // up to 5 s × N.
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 async fn benchmark_target(
     binary: &Path,
     config: &Path,
@@ -143,22 +234,24 @@ async fn benchmark_target(
 
     eprintln!("[{}] starting proxy: {}", target_name, binary.display());
 
-    // Start proxy process (SOCKS5 config for W1–W3)
-    let mut child = Command::new(binary)
-        .args(["-f", &config.to_string_lossy()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| anyhow::anyhow!("failed to start {}: {}", binary.display(), e))?;
+    // Start proxy process (SOCKS5 config for W1–W3).  The guard reaps
+    // the child on every error path; the success path reaps it
+    // explicitly via `ChildGuard::shutdown`.
+    let child = ChildGuard::new(
+        Command::new(binary)
+            .arg(&args.binary_arg)
+            .arg(config.as_os_str())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("failed to start {}: {}", binary.display(), e))?,
+    );
 
     let pid = child.id();
 
-    // Wait for SOCKS5 port to be ready
-    if let Err(e) = wait_for_port(proxy_addr, Duration::from_secs(10)).await {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(e);
-    }
+    // Wait for SOCKS5 port to be ready (the guard reaps the child if
+    // this or any later step fails).
+    wait_for_port(proxy_addr, Duration::from_secs(10)).await?;
     eprintln!("[{target_name}] proxy ready on port {PROXY_PORT}");
 
     // Settle time
@@ -180,15 +273,29 @@ async fn benchmark_target(
         rss_idle as f64 / 1048576.0
     );
 
-    // Warmup
+    // Warmup.  Each connection is bounded by the socks5 connect timeout
+    // and the whole phase by a hard deadline, so a proxy whose dial path
+    // stalls surfaces an error instead of wedging the harness.
     eprintln!("[{target_name}] warming up...");
-    for _ in 0..50 {
-        if let Ok(mut s) = socks5_client::socks5_connect(proxy_addr, echo_addr).await {
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            let _ = s.write_all(&[0x42]).await;
-            let mut buf = [0u8; 1];
-            let _ = s.read_exact(&mut buf).await;
+    let warmup = async {
+        for _ in 0..50 {
+            if let Ok(mut s) = socks5_client::socks5_connect(proxy_addr, echo_addr).await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let _ = tokio::time::timeout(Duration::from_secs(10), async {
+                    s.write_all(&[0x42]).await?;
+                    let mut buf = [0u8; 1];
+                    s.read_exact(&mut buf).await?;
+                    Ok::<_, std::io::Error>(())
+                })
+                .await;
+            }
         }
+    };
+    if tokio::time::timeout(Duration::from_secs(30), warmup)
+        .await
+        .is_err()
+    {
+        eprintln!("[{target_name}] warmup deadline hit — continuing anyway");
     }
 
     let run_all = args.only.is_none();
@@ -235,6 +342,7 @@ async fn benchmark_target(
                 duration_secs: 0.0,
                 total_connections: 0,
                 connections_per_sec: 0.0,
+                echo_timeouts: 0,
             },
             rss_idle,
         )
@@ -246,12 +354,12 @@ async fn benchmark_target(
         rss_load as f64 / 1048576.0
     );
 
-    // Stop the SOCKS5 proxy process before starting the DNS process
+    // Stop the SOCKS5 proxy process before starting the DNS process.
+    // SIGTERM first on Unix with a bounded grace period for a graceful
+    // shutdown; SIGKILL only if it does not exit in time.  On Windows
+    // the child is terminated directly (a no-op once it exited).
     eprintln!("[{target_name}] stopping SOCKS5 proxy...");
-    let _ = Command::new("kill")
-        .args(["-TERM", &pid.to_string()])
-        .status();
-    let _ = child.wait();
+    child.shutdown().await;
     echo_handle.abort();
 
     // W4 — DNS QPS (separate process with DNS-enabled config)
@@ -259,20 +367,20 @@ async fn benchmark_target(
         (true, Some(dns_config)) => {
             eprintln!("[{}] starting DNS proxy: {}", target_name, binary.display());
 
-            let mut dns_child = Command::new(binary)
-                .args(["-f", &dns_config.to_string_lossy()])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .map_err(|e| anyhow::anyhow!("failed to start DNS proxy: {e}"))?;
+            let dns_child = ChildGuard::new(
+                Command::new(binary)
+                    .arg(&args.binary_arg)
+                    .arg(dns_config.as_os_str())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .map_err(|e| anyhow::anyhow!("failed to start DNS proxy: {e}"))?,
+            );
 
-            let dns_pid = dns_child.id();
             let dns_addr: SocketAddr = format!("127.0.0.1:{}", args.dns_port).parse()?;
 
             let ready = wait_for_udp_port(dns_addr, Duration::from_secs(10)).await;
             if let Err(e) = ready {
-                let _ = dns_child.kill();
-                let _ = dns_child.wait();
                 eprintln!("[{target_name}] DNS port not ready: {e} — skipping W4");
                 None
             } else {
@@ -282,10 +390,8 @@ async fn benchmark_target(
                 eprintln!("[{target_name}] benchmarking DNS QPS...");
                 let dns_result = bench_dns::bench_dns(dns_addr, args.duration).await;
 
-                let _ = Command::new("kill")
-                    .args(["-TERM", &dns_pid.to_string()])
-                    .status();
-                let _ = dns_child.wait();
+                // Graceful stop (SIGTERM + grace on Unix), no Child leak.
+                dns_child.shutdown().await;
 
                 match dns_result {
                     Ok(r) => Some(r),
@@ -380,20 +486,21 @@ async fn run_memleak_test(args: &Args) -> anyhow::Result<()> {
     }
 
     eprintln!("[memleak] starting proxy...");
-    let mut child = Command::new(&args.rust_binary)
-        .args(["-f", &args.memleak_config.to_string_lossy()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| anyhow::anyhow!("failed to start {}: {e}", args.rust_binary.display()))?;
+    // The guard reaps the child on every error path below (`?`
+    // returns included); the success path stops it gracefully via
+    // `ChildGuard::shutdown`.
+    let child = ChildGuard::new(
+        Command::new(&args.rust_binary)
+            .args(["-f", &args.memleak_config.to_string_lossy()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("failed to start {}: {e}", args.rust_binary.display()))?,
+    );
 
     let pid = child.id();
 
-    if let Err(e) = wait_for_port(proxy_addr, Duration::from_secs(15)).await {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(e);
-    }
+    wait_for_port(proxy_addr, Duration::from_secs(15)).await?;
     eprintln!(
         "[memleak] proxy ready (pid {pid}) on port {}",
         args.memleak_port
@@ -416,11 +523,11 @@ async fn run_memleak_test(args: &Args) -> anyhow::Result<()> {
     )
     .await?;
 
-    // Stop proxy
-    let _ = Command::new("kill")
-        .args(["-TERM", &pid.to_string()])
-        .status();
-    let _ = child.wait();
+    // Stop the proxy gracefully: SIGTERM first on Unix with a bounded
+    // grace period, SIGKILL only as a fallback; on Windows terminate
+    // directly.  `shutdown` disarms the guard — no `Child` handle is
+    // leaked.
+    child.shutdown().await;
 
     let json = serde_json::to_string_pretty(&result)?;
     if let Some(output_path) = &args.output {
