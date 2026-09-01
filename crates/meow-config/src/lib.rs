@@ -105,24 +105,45 @@ pub struct DnsConfig {
     pub proxy_resolver: Option<Arc<Resolver>>,
 }
 
-/// Listener protocol type — mirrors the `type:` field in the YAML `listeners:` array.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Listener specification — the `type:` field of a `listeners:` entry together
+/// with the per-type parameters that used to live as loose fields on
+/// `NamedListener` (e.g. `tproxy_sni`). Carrying the data inside the variant
+/// makes "a `TProxy` listener always has a `sni` flag" a compile-time invariant
+/// instead of a runtime `Option::expect`, and keeps `NamedListener` from
+/// accumulating one `Option<ProtoConfig>` per future listener type.
+///
+/// Only the four pre-existing inbound kinds are modelled here; the
+/// `shadowsocks` encrypted-server inbound (and others) will join this enum as
+/// data-carrying variants when implemented.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum ListenerType {
+pub enum ListenerSpec {
     Mixed,
     Http,
     Socks5,
-    TProxy,
+    /// Transparent-proxy listener; `sni` is the per-listener override of the
+    /// global `tproxy-sni` sniffer default (resolved at config-build time).
+    TProxy {
+        sni: bool,
+    },
 }
 
-impl std::fmt::Display for ListenerType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl ListenerSpec {
+    /// Canonical lowercase `type:` string used by the API (`GET /listeners`)
+    /// and startup logs. Equivalent to the upstream mihomo `type:` value.
+    pub fn type_name(&self) -> &'static str {
         match self {
-            ListenerType::Mixed => write!(f, "mixed"),
-            ListenerType::Http => write!(f, "http"),
-            ListenerType::Socks5 => write!(f, "socks5"),
-            ListenerType::TProxy => write!(f, "tproxy"),
+            Self::Mixed => "mixed",
+            Self::Http => "http",
+            Self::Socks5 => "socks5",
+            Self::TProxy { .. } => "tproxy",
         }
+    }
+}
+
+impl std::fmt::Display for ListenerSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.type_name())
     }
 }
 
@@ -130,11 +151,10 @@ impl std::fmt::Display for ListenerType {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NamedListener {
     pub name: String,
-    #[serde(rename = "type")]
-    pub listener_type: ListenerType,
+    /// Protocol kind + per-type parameters (e.g. `TProxy { sni }`).
+    pub spec: ListenerSpec,
     pub port: u16,
     pub listen: String,
-    pub tproxy_sni: bool,
     /// Cap on concurrent in-flight inbound connections for this listener.
     /// `0` explicitly disables the cap; the default is 256. Resolved from the per-listener
     /// `max-connections` field, falling back to the global `max-connections`.
@@ -1483,14 +1503,25 @@ pub(crate) fn resolve_listener_bind(
     )
 }
 
-/// Parse `type:` string from a `listeners:` entry into `ListenerType`.
+/// Parse `type:` string from a `listeners:` entry into a `ListenerSpec`.
 /// Hard errors on unknown types (Class A per ADR-0002).
-fn parse_listener_type(s: &str) -> Result<ListenerType, anyhow::Error> {
+///
+/// `per_listener_sni` / `global_tproxy_sni` are folded into the `TProxy`
+/// variant here so the returned spec is always complete — callers never
+/// need to overwrite a placeholder `sni` value. Both parameters are ignored
+/// for non-TProxy types.
+fn parse_listener_spec(
+    s: &str,
+    per_listener_sni: Option<bool>,
+    global_tproxy_sni: bool,
+) -> Result<ListenerSpec, anyhow::Error> {
     match s.to_lowercase().as_str() {
-        "mixed" => Ok(ListenerType::Mixed),
-        "http" => Ok(ListenerType::Http),
-        "socks5" => Ok(ListenerType::Socks5),
-        "tproxy" => Ok(ListenerType::TProxy),
+        "mixed" => Ok(ListenerSpec::Mixed),
+        "http" => Ok(ListenerSpec::Http),
+        "socks5" => Ok(ListenerSpec::Socks5),
+        "tproxy" => Ok(ListenerSpec::TProxy {
+            sni: per_listener_sni.unwrap_or(global_tproxy_sni),
+        }),
         other => anyhow::bail!(
             "unknown listener type '{other}'; expected mixed, http, socks5, or tproxy"
         ),
@@ -1512,10 +1543,9 @@ fn build_named_listeners(
     let global_max_conns = raw.max_connections.unwrap_or(256);
 
     let mut add = |name: &str,
-                   ltype: ListenerType,
+                   spec: ListenerSpec,
                    port: u16,
                    listen: &str,
-                   tproxy_sni: bool,
                    max_connections: usize|
      -> Result<(), anyhow::Error> {
         // Port 0 is "OS assigns an ephemeral port" — each such listener binds
@@ -1535,10 +1565,9 @@ fn build_named_listeners(
         }
         result.push(NamedListener {
             name: name.to_string(),
-            listener_type: ltype,
+            spec,
             port,
             listen: listen.to_string(),
-            tproxy_sni,
             max_connections,
         });
         Ok(())
@@ -1551,66 +1580,55 @@ fn build_named_listeners(
     if let Some(port) = raw.mixed_port.filter(|p| *p != 0) {
         add(
             "mixed",
-            ListenerType::Mixed,
+            ListenerSpec::Mixed,
             port,
             default_bind,
-            false,
             global_max_conns,
         )?;
     }
     if let Some(port) = raw.socks_port.filter(|p| *p != 0) {
         add(
             "socks",
-            ListenerType::Socks5,
+            ListenerSpec::Socks5,
             port,
             default_bind,
-            false,
             global_max_conns,
         )?;
     }
     if let Some(port) = raw.port.filter(|p| *p != 0) {
         add(
             "http",
-            ListenerType::Http,
+            ListenerSpec::Http,
             port,
             default_bind,
-            false,
             global_max_conns,
         )?;
     }
     if let Some(port) = raw.tproxy_port.filter(|p| *p != 0) {
         add(
             "tproxy",
-            ListenerType::TProxy,
+            ListenerSpec::TProxy {
+                sni: global_tproxy_sni,
+            },
             port,
             "127.0.0.1",
-            global_tproxy_sni,
             global_max_conns,
         )?;
     }
 
     // Explicit `listeners:` entries
     for raw_l in raw.listeners.as_deref().unwrap_or(&[]) {
-        let ltype = parse_listener_type(&raw_l.listener_type)?;
-        let listen_raw = raw_l
-            .listen
-            .as_deref()
-            .unwrap_or(if ltype == ListenerType::TProxy {
+        let spec = parse_listener_spec(&raw_l.listener_type, raw_l.tproxy_sni, global_tproxy_sni)?;
+        let listen_raw = raw_l.listen.as_deref().unwrap_or({
+            if matches!(spec, ListenerSpec::TProxy { .. }) {
                 "127.0.0.1"
             } else {
                 default_bind
-            });
+            }
+        });
         let (listen, port) = resolve_listener_bind(listen_raw, raw_l.port)?;
-        let tproxy_sni = raw_l.tproxy_sni.unwrap_or(global_tproxy_sni);
         let max_connections = raw_l.max_connections.unwrap_or(global_max_conns);
-        add(
-            &raw_l.name,
-            ltype,
-            port,
-            &listen,
-            tproxy_sni,
-            max_connections,
-        )?;
+        add(&raw_l.name, spec, port, &listen, max_connections)?;
     }
 
     Ok(result)

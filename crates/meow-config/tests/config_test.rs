@@ -1,4 +1,4 @@
-use meow_config::load_config_from_str;
+use meow_config::{load_config_from_str, ListenerSpec};
 
 // Some tests use #[tokio::test] because ShadowsocksAdapter plugin startup
 // internally requires a tokio runtime (tokio::process::Command).
@@ -1195,4 +1195,190 @@ port: 0
 "#;
     let config = load_config_from_str(yaml).await.unwrap();
     assert!(config.listeners.named.is_empty());
+}
+
+// ── ListenerSpec sni value tests ───────────────────────────────
+//
+// Verify that the per-listener `tproxy-sni` override and the global
+// `tproxy-sni` default are correctly folded into the `TProxy { sni }`
+// variant at config-build time.
+
+#[tokio::test]
+async fn test_tproxy_shorthand_uses_global_sni_default() {
+    let yaml = r#"
+tproxy-port: 7893
+tproxy-sni: true
+"#;
+    let config = load_config_from_str(yaml).await.unwrap();
+    let tproxy = config
+        .listeners
+        .named
+        .iter()
+        .find(|nl| matches!(nl.spec, ListenerSpec::TProxy { .. }))
+        .expect("tproxy shorthand listener must exist");
+    assert_eq!(
+        tproxy.spec,
+        ListenerSpec::TProxy { sni: true },
+        "shorthand tproxy-port should inherit the global tproxy-sni default"
+    );
+    // TProxy always hard-binds 127.0.0.1
+    assert_eq!(tproxy.listen, "127.0.0.1");
+}
+
+#[tokio::test]
+async fn test_tproxy_shorthand_global_sni_false() {
+    let yaml = r#"
+tproxy-port: 7893
+tproxy-sni: false
+"#;
+    let config = load_config_from_str(yaml).await.unwrap();
+    let tproxy = config
+        .listeners
+        .named
+        .iter()
+        .find(|nl| matches!(nl.spec, ListenerSpec::TProxy { .. }))
+        .expect("tproxy shorthand listener must exist");
+    assert_eq!(
+        tproxy.spec,
+        ListenerSpec::TProxy { sni: false },
+        "shorthand tproxy-port with global tproxy-sni: false"
+    );
+}
+
+#[tokio::test]
+async fn test_tproxy_named_listener_per_listener_sni_override() {
+    let yaml = r#"
+tproxy-sni: false
+listeners:
+  - name: my-tproxy
+    type: tproxy
+    listen: 127.0.0.1:7894
+    tproxy-sni: true
+"#;
+    let config = load_config_from_str(yaml).await.unwrap();
+    let tproxy = config
+        .listeners
+        .named
+        .iter()
+        .find(|nl| nl.name == "my-tproxy")
+        .expect("named tproxy listener must exist");
+    assert_eq!(
+        tproxy.spec,
+        ListenerSpec::TProxy { sni: true },
+        "per-listener tproxy-sni: true must override the global false default"
+    );
+}
+
+#[tokio::test]
+async fn test_tproxy_named_listener_falls_back_to_global_sni() {
+    let yaml = r#"
+tproxy-sni: true
+listeners:
+  - name: my-tproxy
+    type: tproxy
+    listen: 127.0.0.1:7894
+"#;
+    let config = load_config_from_str(yaml).await.unwrap();
+    let tproxy = config
+        .listeners
+        .named
+        .iter()
+        .find(|nl| nl.name == "my-tproxy")
+        .expect("named tproxy listener must exist");
+    assert_eq!(
+        tproxy.spec,
+        ListenerSpec::TProxy { sni: true },
+        "named tproxy without per-listener tproxy-sni should fall back to global true"
+    );
+}
+
+#[tokio::test]
+async fn test_tproxy_named_listener_default_listen_is_loopback() {
+    // Without an explicit `listen:`, a tproxy named listener should default
+    // to 127.0.0.1 (matching the shorthand behaviour), not the global bind.
+    let yaml = r#"
+bind-address: 0.0.0.0
+listeners:
+  - name: my-tproxy
+    type: tproxy
+    port: 7895
+"#;
+    let config = load_config_from_str(yaml).await.unwrap();
+    let tproxy = config
+        .listeners
+        .named
+        .iter()
+        .find(|nl| nl.name == "my-tproxy")
+        .expect("named tproxy listener must exist");
+    assert_eq!(
+        tproxy.listen, "127.0.0.1",
+        "tproxy named listener without explicit listen should default to 127.0.0.1"
+    );
+}
+
+#[tokio::test]
+async fn test_non_tproxy_listener_spec_values() {
+    let yaml = r#"
+listeners:
+  - name: m
+    type: mixed
+    listen: 127.0.0.1:0
+  - name: h
+    type: http
+    listen: 127.0.0.1:0
+  - name: s
+    type: socks5
+    listen: 127.0.0.1:0
+"#;
+    let config = load_config_from_str(yaml).await.unwrap();
+    let m = config
+        .listeners
+        .named
+        .iter()
+        .find(|nl| nl.name == "m")
+        .unwrap();
+    assert_eq!(m.spec, ListenerSpec::Mixed);
+    let h = config
+        .listeners
+        .named
+        .iter()
+        .find(|nl| nl.name == "h")
+        .unwrap();
+    assert_eq!(h.spec, ListenerSpec::Http);
+    let s = config
+        .listeners
+        .named
+        .iter()
+        .find(|nl| nl.name == "s")
+        .unwrap();
+    assert_eq!(s.spec, ListenerSpec::Socks5);
+}
+
+#[tokio::test]
+async fn test_listener_type_name() {
+    // type_name() is the canonical string used by the API (`GET /listeners`)
+    // and startup logs. Verify it matches the upstream mihomo `type:` value.
+    assert_eq!(ListenerSpec::Mixed.type_name(), "mixed");
+    assert_eq!(ListenerSpec::Http.type_name(), "http");
+    assert_eq!(ListenerSpec::Socks5.type_name(), "socks5");
+    assert_eq!(ListenerSpec::TProxy { sni: true }.type_name(), "tproxy");
+    assert_eq!(ListenerSpec::TProxy { sni: false }.type_name(), "tproxy");
+}
+
+#[tokio::test]
+async fn test_unknown_listener_type_errors() {
+    let yaml = r#"
+listeners:
+  - name: bad
+    type: socks4
+    listen: 127.0.0.1:0
+"#;
+    let Err(err) = load_config_from_str(yaml).await else {
+        panic!("unknown listener type must hard-error");
+    };
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("unknown listener type") && msg.contains("socks4"),
+        "error should name the bad type: {msg}"
+    );
 }

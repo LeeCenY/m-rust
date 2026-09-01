@@ -2545,7 +2545,7 @@ async fn get_listeners(State(state): State<Arc<AppState>>) -> Json<serde_json::V
         .map(|l| {
             serde_json::json!({
                 "name": l.name,
-                "type": l.listener_type.to_string(),
+                "type": l.spec.type_name(),
                 "port": l.port,
                 "listen": l.listen,
             })

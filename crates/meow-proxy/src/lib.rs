@@ -19,10 +19,6 @@ pub mod transport_chain;
 pub mod ech_tls_tunnel;
 #[cfg(feature = "ss")]
 pub mod shadowsocks_adapter;
-// simple-obfs is shared with the snell adapter (which reuses the
-// http / tls obfuscation codecs verbatim).
-#[cfg(any(feature = "ss", feature = "snell"))]
-pub mod simple_obfs;
 #[cfg(feature = "ss")]
 pub mod v2ray_plugin;
 
