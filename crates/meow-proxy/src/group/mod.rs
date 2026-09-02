@@ -1,5 +1,5 @@
 use meow_common::atomic::AtomicU;
-use meow_common::{AdapterType, MeowError, Proxy};
+use meow_common::{AdapterType, ConnType, MeowError, Metadata, Proxy};
 use parking_lot::Mutex;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -18,6 +18,21 @@ impl UsageTracker {
 
     pub(super) fn touch(&self) {
         self.0.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a use, but only for real user traffic.
+    ///
+    /// Health-check probes dial with [`ConnType::Tunnel`] — an internal
+    /// marker set by `health::url_test` (no production dialer uses the
+    /// variant).  Counting probes as uses would defeat lazy mode for
+    /// nested groups: a parent group's periodic probes would mark a lazy
+    /// child as used and keep its own probe loop awake forever without
+    /// any real traffic.
+    pub(super) fn touch_user_traffic(&self, metadata: &Metadata) {
+        if metadata.conn_type == ConnType::Tunnel {
+            return;
+        }
+        self.touch();
     }
 
     pub(super) fn generation(&self) -> u64 {
